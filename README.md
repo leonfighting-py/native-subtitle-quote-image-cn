@@ -1,5 +1,7 @@
 # native-subtitle-quote-image-cn
 
+[![Tests](https://github.com/leonfighting-py/native-subtitle-quote-image-cn/actions/workflows/tests.yml/badge.svg)](https://github.com/leonfighting-py/native-subtitle-quote-image-cn/actions/workflows/tests.yml)
+
 把真实视频帧做成保留原字幕或绘制台词的长图。本仓库是
 [chengyi-ai/native-subtitle-quote-image](https://github.com/chengyi-ai/native-subtitle-quote-image) **v2.3.0 的增强分支**，
 补上中国大陆视频平台与竖屏素材这两块上游未覆盖的场景，并修掉一个取帧边界 bug。
@@ -104,6 +106,9 @@ python3 -m unittest discover -s tests
 ```
 
 39 个用例，覆盖布局几何、字幕带识别、重复帧拦截、CLI 集成与本次修复的回归。
+
+CI（[`.github/workflows/tests.yml`](.github/workflows/tests.yml)）在每次 push 与 PR 时
+于 Python 3.10 和 3.13 上跑全套测试，并检查 CLI 可用性。
 
 ## 边界与未验证项
 
