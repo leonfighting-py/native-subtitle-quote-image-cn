@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -271,6 +272,72 @@ def cjk_font():
         if Path(path).exists():
             return path
     return None
+
+
+class FfmpegResolutionTests(unittest.TestCase):
+    """时长校正依赖能不能解析到 FFmpeg。CI 在这里抓到过一个真缺陷。"""
+
+    SAMPLE_LINES = [
+        "先交代一下背景情况", "政策影响了整个市场结构",
+        "企业必须重新评估自己的定位", "因为成本上升会挤压利润空间",
+        "所以结论是需要提前布局", "而不是等到变化发生之后",
+    ]
+
+    def test_resolve_ffmpeg_falls_back_to_path(self):
+        """没有 imageio-ffmpeg 时要能回落到 PATH 上的 ffmpeg。
+
+        原来的实现只写裸 "ffmpeg"，等于既没试 imageio-ffmpeg 也没做回落判断；
+        本机装了系统 ffmpeg 所以看不出来，CI 上一跑就暴露。
+        """
+        import builtins
+
+        saved = (MODULE._FFMPEG, MODULE._FFMPEG_TRIED)
+        MODULE._FFMPEG, MODULE._FFMPEG_TRIED = None, False
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "imageio_ffmpeg":
+                raise ImportError("模拟未安装 imageio-ffmpeg")
+            return real_import(name, *args, **kwargs)
+
+        try:
+            with mock.patch.object(builtins, "__import__", side_effect=fake_import):
+                with mock.patch("shutil.which", return_value="/fake/bin/ffmpeg"):
+                    self.assertEqual(MODULE.resolve_ffmpeg(), "/fake/bin/ffmpeg")
+        finally:
+            MODULE._FFMPEG, MODULE._FFMPEG_TRIED = saved
+
+    def test_resolve_ffmpeg_finds_something_in_this_environment(self):
+        """顺序与 native_subtitle_stitch.py 一致：先 imageio-ffmpeg，再 PATH。"""
+        saved = (MODULE._FFMPEG, MODULE._FFMPEG_TRIED)
+        MODULE._FFMPEG, MODULE._FFMPEG_TRIED = None, False
+        try:
+            self.assertTrue(MODULE.resolve_ffmpeg(), "解析不到任何 FFmpeg，环境不完整")
+        finally:
+            MODULE._FFMPEG, MODULE._FFMPEG_TRIED = saved
+
+    def test_unreadable_video_duration_is_flagged_not_silently_ignored(self):
+        """找到了视频却读不出时长，必须标注出来，不能静默当成转写时长可信。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "clip.mp4").write_bytes(b"stub")
+            lines = self.SAMPLE_LINES
+            transcript = {
+                "text": "".join(lines), "duration": 40.0,
+                "backend": "test", "model": "test",
+                "segments": make_segments(lines),
+            }
+            source = folder / "clip.mp4.transcript.json"
+            source.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+
+            out = folder / "out"
+            with mock.patch.object(MODULE, "probe_duration", return_value=None):
+                MODULE.process_one(source, out, 1)
+
+            payload = json.loads((out / "candidates.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["duration_source"], "transcript-no-ffmpeg")
+            review = (out / "审阅表.md").read_text(encoding="utf-8")
+            self.assertIn("未经真实时长校正", review)
 
 
 class RenderTests(unittest.TestCase):

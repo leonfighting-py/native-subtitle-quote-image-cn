@@ -110,6 +110,12 @@ python3 skills/native-subtitle-quote-image/scripts/select_quotes.py batch \
 后三项都补了回归测试并做反向验证。竖屏素材在脚本模式下的**字幕重影**问题也在文档中给出
 实测解法（`--frame-bottom 0.55 --band-center 0.5`）。
 
+时长校正还暴露了一个只在 CI 上才现形的问题：`probe_duration` 起初只写裸 `"ffmpeg"` 命令，
+而 `requirements.txt` 走的是 `imageio-ffmpeg`。开发机上装了系统 ffmpeg 所以一直是绿的，
+CI 上没有系统 ffmpeg，时长校正**静默失效**。现已与 `native_subtitle_stitch.py` 统一解析顺序
+（先 `imageio-ffmpeg`，再 PATH），并且在「找到视频却读不出时长」时明确标注
+`transcript-no-ffmpeg`，不再静默当成转写时长可信。
+
 ### 版本号
 
 `VERSION` 标为 `2.3.0-cn.2`。`check_update.py` 的更新检查仍指向上游仓库，
@@ -156,11 +162,12 @@ python3 skills/native-subtitle-quote-image/scripts/check_environment.py --url-mo
 python3 -m unittest discover -s tests
 ```
 
-61 个用例，覆盖布局几何、字幕带识别、重复帧拦截、清洗去重、打分信号、时长校正、
-两个字幕模式的端到端出图，以及三处修复的回归。
+64 个用例，覆盖布局几何、字幕带识别、重复帧拦截、清洗去重、打分信号、时长校正与 FFmpeg 解析、
+两个字幕模式的端到端出图，以及四处修复的回归。
 
 CI（[`.github/workflows/tests.yml`](.github/workflows/tests.yml)）在每次 push 与 PR 时
 于 Python 3.10 和 3.13 上跑全套测试，并检查 CLI 可用性。
+缺少中日韩字体的环境下，脚本字幕的渲染用例会明确跳过而不是误报失败。
 
 ## 边界与未验证项
 

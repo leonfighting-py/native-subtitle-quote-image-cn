@@ -502,6 +502,11 @@ def render_review(
             if declared and drift is not None
             else "- 时长来源：视频实测"
         )
+    elif duration_source == "transcript-no-ffmpeg":
+        out.append(
+            "- 时长来源：**转写自带** —— 找到了同名视频，但读不出时长"
+            "（FFmpeg 不可用）。时间点未经真实时长校正，出图前请先装好 FFmpeg 或 imageio-ffmpeg。"
+        )
     else:
         out.append("- 时长来源：转写自带（没找到同名视频，时间点未经真实时长校正）")
     out.append(f"- 转写模型：{meta.get('model') or '未知'}")
@@ -568,13 +573,43 @@ def render_review(
 # ---------------------------------------------------------------- 命令
 
 
+_FFMPEG: str | None = None
+_FFMPEG_TRIED = False
+
+
+def resolve_ffmpeg() -> str | None:
+    """解析 FFmpeg，顺序与 native_subtitle_stitch.py 保持一致。
+
+    先试 imageio-ffmpeg 自带的二进制，再回落到 PATH。
+    不能只写裸 "ffmpeg"：requirements.txt 走的就是 imageio-ffmpeg，
+    在没装系统 ffmpeg 的机器上裸命令不存在，时长校正会静默失效——
+    这正是 CI 抓到的问题（本地装了系统 ffmpeg 所以看不出来）。
+    """
+    global _FFMPEG, _FFMPEG_TRIED
+    if _FFMPEG_TRIED:
+        return _FFMPEG
+    _FFMPEG_TRIED = True
+    try:
+        import imageio_ffmpeg
+
+        _FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001 - 没装就回落到 PATH
+        import shutil
+
+        _FFMPEG = shutil.which("ffmpeg")
+    return _FFMPEG
+
+
 def probe_duration(video: Path) -> float | None:
-    """只在 --video 给了的时候用，避免和渲染脚本重复实现取帧逻辑。"""
+    """读视频的真实时长。取不到就返回 None，由调用方决定怎么标注。"""
     import subprocess
 
+    engine = resolve_ffmpeg()
+    if not engine:
+        return None
     try:
         result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-i", str(video)],
+            [engine, "-hide_banner", "-i", str(video)],
             capture_output=True, text=True, timeout=60,
         )
     except (OSError, subprocess.SubprocessError):
@@ -601,6 +636,9 @@ def process_one(
         if probed:
             duration = probed
             duration_source = "video"
+        else:
+            # 有视频却读不到时长：标注出来，不要静默当成转写时长可信
+            duration_source = "transcript-no-ffmpeg"
     drift = None
     if declared and duration and duration > 0:
         drift = round(declared - duration, 2)
