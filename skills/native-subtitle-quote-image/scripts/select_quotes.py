@@ -97,18 +97,17 @@ WEIGHTS = {
 
 
 def load_transcript(path: Path) -> tuple[list[dict], float | None, dict]:
-    """读 .transcript.json / .json / .srt，返回 (segments, duration, meta)。"""
+    """读 .transcript.json / .json / .srt / .vtt，返回 (segments, duration, meta)。"""
     text = path.read_text(encoding="utf-8", errors="replace")
     suffix = path.suffix.lower()
 
-    if suffix == ".srt":
-        parsed, inferred = parse_srt(text)
-        return parsed, inferred, {"source": "srt"}
+    if suffix in (".srt", ".vtt"):
+        return parse_cue_subtitles(text, source=suffix.lstrip("."))
 
     stripped = text.lstrip()
     if not stripped.startswith(("{", "[")):
         raise SystemExit(
-            f"{path} 看起来不是 JSON 也不是 SRT。只有纯文本、没有时间戳的 .txt "
+            f"{path} 看起来不是 JSON、SRT 或 VTT。只有纯文本、没有时间戳的 .txt "
             "无法定位取帧时间，请先转写（见 references/yt-dlp-and-transcripts.md）。"
         )
 
@@ -149,30 +148,135 @@ def load_transcript(path: Path) -> tuple[list[dict], float | None, dict]:
     return segments, (float(duration) if duration else None), meta
 
 
-def parse_srt(text: str) -> tuple[list[dict], float | None]:
-    """解析 SRT。SRT 没有总时长字段，用末段时间当兜底。"""
+TAG_PATTERN = re.compile(r"<[^>]*>")
+STAMP_PATTERN = re.compile(
+    r"(\d+):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d+):(\d{2}):(\d{2})[,.](\d{3})"
+)
+
+
+def _clean_cue_lines(body_lines: list[str]) -> list[str]:
+    """去掉 VTT 的行内标签，返回有内容的行为列表。
+
+    yt-dlp 原生的 YouTube 自动字幕 VTT 里，正文其实长这样：
+        Hear<00:00:19.720><c> that?</c>
+    实测同一份字幕 315 个 cue 里有 113 个带这种标签。不剥掉的话，
+    `<c>` 和词级时间戳会被当成台词画进图里。
+    """
+    cleaned = []
+    for line in body_lines:
+        text = TAG_PATTERN.sub("", line).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+def _rolling_tail(previous: list[str], current: list[str]) -> tuple[list[str], bool]:
+    """从滚动字幕里取出「本次新增的行」，返回 (可用行, 是否命中滚动结构)。
+
+    YouTube 自动字幕是滚动缓冲式的：画面始终显示「上一行 + 当前行」，
+    于是每条 cue 都把上一行又抄一遍。实测 315 个 cue 里有一半是 10 毫秒的
+    「翻转 cue」，正文只有被顶掉的那一行。原样读进来，每句话会出现 2–3 次。
+
+    只认**严格变长且上一条是前缀**这一种形态。刻意不认下面两种：
+
+      - `current == previous`：翻转 cue 确实长这样，但中文口语里「对」「嗯」连着重复
+        也长这样。实测 60 份 Whisper SRT 里有 31 处命中，全是正常重复而非滚动。
+        这类重复交给下游 `sanitize` 按「与前面的段完全重复」丢弃即可，代价为零
+        （实测收紧后 VTT 与 SRT 两条路径的最终选句结果逐字相同）。
+      - 「current 的行都在 previous 里出现过」：太松，会把正常字幕里重复出现的短句吃掉。
+
+    人工字幕（每 cue 是完整的一两行、且比上一条长不出前缀关系）两条都不命中，原样保留。
+    """
+    if previous and len(current) > len(previous) and current[: len(previous)] == previous:
+        return current[len(previous) :], True
+    return current, False
+
+
+BLOCK_DIRECTIVE = re.compile(r"^(NOTE|STYLE|WEBVTT|Kind\s*:|Language\s*:)", re.IGNORECASE)
+
+
+def parse_cue_subtitles(text: str, source: str = "srt") -> tuple[list[dict], float | None, dict]:
+    """解析 SRT / VTT 字幕，返回 (segments, duration, meta)。
+
+    SRT 和 VTT 没有总时长字段，用末段时间当兜底。
+
+    按行扫描而不是按空行切块：VTT 的 cue 正文里会夹着**只含空白的行**
+    （滚动字幕换行留下的），空行切块会把一条 cue 劈成两半，
+    时间戳那半成了孤块、正文那半被当成没有时间戳的块丢掉。
+    实测 YouTube 原生 VTT 第一条就是这样丢掉「Hear that?」的。
+
+    **必须裁剪相邻重叠**：YouTube 自动字幕实测 91% 的相邻 cue 互相重叠，
+    cue[i].end 恰好多半等于 cue[i+2].start（中位差 0.000 秒、83% 在 0.05 秒内）。
+    不裁的话时间轴会交叠，取帧点会落在两句话之间。
+    把每条的 end 裁到下一条的 start，阅读顺序就恢复成正确的单调序列。
+    对 Whisper 那种本来就不重叠的 SRT，这一步是空操作。
+    """
+    lines = text.splitlines()
     segments = []
-    pattern = re.compile(
-        r"(\d+):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d+):(\d{2}):(\d{2})[,.](\d{3})"
-    )
-    for block in re.split(r"\n\s*\n", text.strip()):
-        lines = [line for line in block.splitlines() if line.strip()]
-        if not lines:
-            continue
-        match = pattern.search(block)
+    rolling_merged = 0
+    previous_lines: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = STAMP_PATTERN.search(lines[index])
         if not match:
+            index += 1
             continue
         h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(value) for value in match.groups())
         start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
         end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
-        body = " ".join(
-            line.strip() for line in lines if not pattern.search(line) and not line.strip().isdigit()
-        ).strip()
-        if body:
-            segments.append({"start": start, "end": end, "text": body})
+
+        body: list[str] = []
+        index += 1
+        while index < len(lines):
+            line = lines[index]
+            if STAMP_PATTERN.search(line):
+                break
+            if BLOCK_DIRECTIVE.match(line.strip()):
+                break
+            # 紧挨着时间戳的那一行是下一条 cue 的抬头，不是本条正文：
+            # SRT 是序号行（`2`），VTT 是 cue 标识（`cue-00002`）。
+            # WebVTT 与 SRT 都以空行分隔 cue，所以正文末行不会紧邻时间戳。
+            if index + 1 < len(lines) and STAMP_PATTERN.search(lines[index + 1]):
+                break
+            body.append(line)
+            index += 1
+
+        # 标签只在「时间戳行之后」的正文里剥，避免动到 VTT 头部
+        cleaned = _clean_cue_lines(body)
+        if not cleaned:
+            continue
+
+        tail, rolled = _rolling_tail(previous_lines, cleaned)
+        previous_lines = cleaned
+        if rolled:
+            rolling_merged += 1
+        if not tail:
+            continue
+        segments.append({"start": start, "end": end, "text": " ".join(tail)})
+
     if not segments:
-        raise SystemExit("SRT 里没有解析出任何字幕块")
-    return segments, max(seg["end"] for seg in segments)
+        raise SystemExit("字幕里没有解析出任何可用字幕块")
+
+    segments.sort(key=lambda item: item["start"])
+    clipped = 0
+    for index, segment in enumerate(segments[:-1]):
+        following = segments[index + 1]["start"]
+        if segment["end"] > following:
+            segment["end"] = following
+            clipped += 1
+    segments = [item for item in segments if item["end"] > item["start"]]
+    if not segments:
+        raise SystemExit("字幕重叠裁剪后没有剩余可用字幕")
+
+    return (
+        segments,
+        max(seg["end"] for seg in segments),
+        {
+            "source": source,
+            "clipped_overlaps": clipped,
+            "rolling_cues_merged": rolling_merged,
+        },
+    )
 
 
 # ---------------------------------------------------------------- 清洗
@@ -365,12 +469,21 @@ def score_window(window: dict) -> dict:
 
 
 def pick_windows(
-    windows: list[dict], top: int, max_line_overlap: float = 0.34, min_line_gap: int = 3
+    windows: list[dict], top: int, max_line_overlap: float = 0.34
 ) -> list[dict]:
     """按分数贪心选，避免几张图讲同一件事。
 
-    两道去重：共享行数比例过高，或起始行挨得太近，都视为重复。
-    实测只靠时间重叠不够——两个窗口可以时间上只压边，却共享大部分行。
+    两道去重，任一命中即视为重复：
+    1. 共享行数比例过高——两个窗口可以时间上只压边，却共享大部分行；
+    2. **新窗口的起点落在已选窗口内部**——窗口是逐行滑动造的，相邻窗口天然重叠，
+       只按比例判会漏掉「第 2 张从第 1 张的第 4 行开始」这种嵌套。
+       实测（119 份文字稿）换成这条嵌套规则后，选出的总张数不变、最高分窗口全部保留，
+       但含重复行的期数从 71 降到 40，平均最大共享比从 0.147 降到 0.082。
+
+    早先这条是 `abs(index 差) < 3` 的固定间隔，对中文 Whisper 段（中位 14 字）勉强够用，
+    对 YouTube 自动字幕（中位 32 字、行数少而信息密）就太松：实测同一段 TED 演讲里
+    第 1、2 组共享了「have for you all」这一行，因为 1/5 = 0.20 低于阈值、索引差又是 4。
+    改成按窗口自身长度判定后，规则随窗口大小自适应，不再依赖某个魔数。
     """
     ranked = sorted(windows, key=lambda item: (-item["score"]["total"], item["start"]))
     chosen: list[dict] = []
@@ -385,7 +498,7 @@ def pick_windows(
             if shared / min(len(candidate_lines), len(picked_lines)) >= max_line_overlap:
                 too_close = True
                 break
-            if abs(candidate["index"] - picked["index"]) < min_line_gap:
+            if picked["index"] <= candidate["index"] < picked["index"] + picked["size"]:
                 too_close = True
                 break
         if not too_close:
@@ -793,20 +906,41 @@ def aggregate(out_root: Path, top: int) -> dict:
 
 
 def discover_transcripts(root: Path) -> list[Path]:
-    found = sorted(root.rglob("*.transcript.json"))
-    return found or sorted(root.rglob("*.json"))
+    """找待处理的文字稿。优先带时间戳的格式，纯 .json 放最后兜底。"""
+    for pattern in ("*.transcript.json", "*.srt", "*.vtt", "*.json"):
+        found = sorted(root.rglob(pattern))
+        # 排除视频附带的其它 json（如 yt-dlp 的 .info.json 是元数据不是文字稿）
+        found = [item for item in found if not item.name.endswith(".info.json")]
+        if found:
+            return found
+    return []
+
+
+VIDEO_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov", ".flv", ".m4v", ".avi", ".ts")
 
 
 def sibling_video(transcript: Path) -> Path | None:
     """找与文字稿同名的视频。
 
-    douyin-asr-pipeline 这类流水线把 X.mp4 和 X.mp4.transcript.json 放在一起，
-    所以批处理时不必手工指定视频路径——认得出兄弟文件就能直接出图。
+    两种命名都要认：
+      douyin-asr-pipeline：`X.mp4` 配 `X.mp4.transcript.json`
+      yt-dlp：           `X.mp4` 配 `X.en.srt`（语言码夹在中间）
+    所以先剥掉已知标记，再拿「全名」和「第一个点之前的部分」两种候选去找视频。
     """
-    for suffix in (".transcript.json", ".transcript.srt", ".json", ".srt"):
-        if transcript.name.endswith(suffix):
-            stem = transcript.name[: -len(suffix)]
-            candidate = transcript.parent / stem
+    stem = transcript.name
+    for suffix in (".transcript.json", ".transcript.srt", ".transcript.vtt",
+                   ".json", ".srt", ".vtt"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+
+    candidates = [stem]
+    if "." in stem:
+        candidates.append(stem.split(".")[0])
+
+    for base in candidates:
+        for extension in VIDEO_SUFFIXES:
+            candidate = transcript.parent / f"{base}{extension}"
             if candidate.is_file():
                 return candidate
     return None

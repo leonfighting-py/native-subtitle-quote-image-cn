@@ -101,21 +101,72 @@ yt-dlp --no-playlist --list-subs "URL"
 
 ### 3. 只下载文字时间轴
 
-优先人工字幕，同时允许自动字幕作为备选：
+优先人工字幕，同时允许自动字幕作为备选。**优先要 `srt`，不要 `vtt`**：
 
 ```bash
 yt-dlp --no-playlist --skip-download \
   --write-subs --write-auto-subs \
-  --sub-langs "zh.*,en.*" --sub-format vtt \
+  --sub-langs "zh.*,en.*" --sub-format "srt/vtt" \
   -o "source/%(id)s/%(id)s.%(ext)s" \
   "URL"
 ```
+
+`--sub-format "srt/vtt"` 是「优先 srt，拿不到才回落到 vtt」。原因不是偏好，是实测差异：
+YouTube 的自动字幕原生只有 VTT，而 VTT 是**滚动缓冲**格式——画面始终显示「上一行 + 当前行」，
+于是每条 cue 都把上一行重抄一遍，还有大量 10 毫秒的切换 cue。实测同一份 TED 演讲：
+
+| | 原生 VTT | yt-dlp 转出的 SRT |
+|---|---|---|
+| 带时间戳的 cue | 315 | 158 |
+| 含行内 `<c>` / 词级时间标签的 cue | 113 | 0 |
+| 正文样例 | `Hear<00:00:19.720><c> that?</c>` | `Hear that?` |
+
+换成 srt 就等于让 yt-dlp 先替你做掉这层归一化。`select_quotes.py` 两条都能读
+（它自己会剥标签、按滚动结构只取新增行、裁掉相邻 cue 的时间重叠），
+但 srt 路径少一层转换，排查问题时更容易看懂。
 
 字幕和视频始终分两条命令下载：字幕命令带 `--skip-download`，视频命令不带任何 `--write-*subs` 参数。这样字幕请求失败（例如 429）不会中止视频下载，视频格式出错也不会白白重复请求字幕。
 
 `zh.*` 这类正则会同时匹配 YouTube 的自动翻译轨（标签形如 `zh-Hans-en`），这类轨道最容易触发 HTTP 429。先看 `--list-subs` 的真实标签，只请求需要的一两个，例如人工字幕 `zh-Hans` 和原声自动字幕 `en-orig`；请求多个语言时加 `--sleep-subtitles 5`。
 
 字幕轨先用来建立“内容—时间点”索引。原生模式不把 VTT 画回图片，也不因为文字稿里有一句话，就假设该时刻画面内烧录字幕完全相同。脚本模式可以使用已复核的 VTT/SRT/Whisper 文字，但必须标明为后期绘制，并将人名、数字、专有名词和翻译含义单独核对。
+
+### 3.5 拿到的字幕怎么接到选句
+
+`--list-subs` 只告诉你有哪些轨；真正决定「截哪几句」的是下一步。
+拿到 SRT/VTT 后直接交给 `select_quotes.py`，不必先看完整支视频：
+
+```bash
+python3 "<SKILL_DIR>/scripts/select_quotes.py" pick "source/<id>/<id>.en.srt" \
+  --out work/<id> --top 5 --render --render-mode script --aspect 3:4 --width 1080
+```
+
+批处理某个频道时把下载目录整个交给它：
+
+```bash
+python3 "<SKILL_DIR>/scripts/select_quotes.py" batch source/ --out work/ --top 5
+```
+
+它按 `*.transcript.json` → `*.srt` → `*.vtt` 的顺序找文字稿，并自动跳过
+yt-dlp 的 `*.info.json`（那是元数据、没有 `segments`）。
+同名视频会被自动认出来当取帧源，包括 yt-dlp 的 `talk.en.srt` ↔ `talk.mp4` 这种命名。
+排序依据与局限见 [auto-quote-selection.md](auto-quote-selection.md)。
+
+### 3.6 英文/非中文素材的两点注意
+
+1. **发布价值这一维在非中文素材上恒为 0**。打分信号词表是按中文写的
+   （「并不是…而是」「归根结底」「必须」…），英文台词一个都不命中。
+   于是英文素材实际只按独立性、连续性、信息密度三维排序——**排的是「结构完整」，
+   不是「值得传播」**。英文素材请把 `--top` 调大、人工过筛的比例留高一些。
+2. **画面下缘常有台标或角标**。TED 这类视频在底部烧了 `NOVEMBER2014 NEWYORKNEWYORK`
+   一类的字标，而字幕条默认取的是画面 0.78–0.96 这一段（这是个横向画幅假设），
+   于是字标会透出来形成重影。实测改这两个参数即可压掉：
+
+   ```bash
+   --frame-bottom 0.82 --band-center 0.96
+   ```
+
+   先出 1 张看效果，再批量。
 
 ### 4. 下载视频
 

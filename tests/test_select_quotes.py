@@ -247,6 +247,245 @@ class SiblingVideoTests(unittest.TestCase):
             transcript.write_text("{}", encoding="utf-8")
             self.assertIsNone(MODULE.sibling_video(transcript))
 
+    def test_finds_video_when_yt_dlp_inserts_language_code(self):
+        """yt-dlp 把语言码夹在中间：talk.mp4 配 talk.en.srt。
+
+        只剥已知后缀是不够的——剥完还剩 "talk.en"，加扩展名找不到 talk.mp4。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            video = folder / "talk.mp4"
+            video.write_bytes(b"stub")
+            subtitle = folder / "talk.en.srt"
+            subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+            self.assertEqual(MODULE.sibling_video(subtitle), video)
+
+    def test_does_not_confuse_a_similarly_named_video(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "talk-2.mp4").write_bytes(b"stub")
+            subtitle = folder / "talk.en.srt"
+            subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+            self.assertIsNone(MODULE.sibling_video(subtitle))
+
+
+class TranscriptDiscoveryTests(unittest.TestCase):
+    """批处理要先找得到文字稿。仓库里同时有 json / srt / txt，还混着 yt-dlp 的元数据。"""
+
+    def _touch(self, folder, name, body="{}"):
+        path = folder / name
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_prefers_transcript_json_over_other_formats(self):
+        """三种格式并存时只用最完整的那份，否则同一期视频会被处理三遍。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            wanted = self._touch(folder, "a.mp4.transcript.json")
+            self._touch(folder, "a.mp4.transcript.srt")
+            self._touch(folder, "a.mp4.transcript.txt")
+            found = MODULE.discover_transcripts(folder)
+            self.assertEqual(found, [wanted])
+
+    def test_falls_back_to_subtitle_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            srt = self._touch(folder, "b.srt")
+            self._touch(folder, "b.txt")
+            self.assertEqual(MODULE.discover_transcripts(folder), [srt])
+
+    def test_yt_dlp_info_json_is_not_treated_as_a_transcript(self):
+        """`--write-info-json` 产出的 .info.json 是元数据，没有 segments，喂进去只会报错。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            subtitle = self._touch(folder, "talk.info.srt")
+            self._touch(folder, "talk.info.json", "{\"id\": \"talk\"}")
+            found = MODULE.discover_transcripts(folder)
+            self.assertIn(subtitle, found)
+            self.assertNotIn(folder / "talk.info.json", found)
+
+
+class SubtitleParsingTests(unittest.TestCase):
+    """SRT / VTT 是 YouTube 与 Whisper 两条链路交回来的格式，也是最容易出错的一环。"""
+
+    # 结构逐字取自 yt-dlp 对同一个 TED 演讲的原生自动字幕 VTT（8S0FDjFBj8o）
+    ROLLING_VTT = """WEBVTT
+Kind: captions
+Language: en
+
+00:00:19.560 --> 00:00:21.950 align:start position:0%
+ 
+Hear<00:00:19.720><c> that?</c>
+
+00:00:21.950 --> 00:00:21.960 align:start position:0%
+Hear that?
+ 
+
+00:00:21.960 --> 00:00:24.830 align:start position:0%
+Hear that?
+That's<00:00:22.960><c> nothing.</c>
+"""
+
+    def test_inline_word_timing_tags_never_reach_the_text(self):
+        """VTT 正文长这样：`Hear<00:00:19.720><c> that?</c>`。
+
+        实测同一份字幕 315 个 cue 里 113 个带标签。不剥掉，`<c>` 会被当台词画进图里。
+        """
+        segments, _, _ = MODULE.parse_cue_subtitles(self.ROLLING_VTT, source="vtt")
+        for segment in segments:
+            self.assertNotIn("<", segment["text"], segment["text"])
+            self.assertNotIn(">", segment["text"], segment["text"])
+        self.assertEqual(segments[0]["text"], "Hear that?")
+
+    def test_first_cue_survives_a_whitespace_only_line(self):
+        """滚动字幕的 cue 正文里夹着只含空白的行。
+
+        按空行切块会把它当成块边界，于是「时间戳」成为孤块、正文成为无时间戳的块被丢掉，
+        结果是 YouTube 自动字幕的第一句话永远丢失。
+        """
+        segments, _, _ = MODULE.parse_cue_subtitles(self.ROLLING_VTT, source="vtt")
+        self.assertEqual(segments[0]["start"], 19.56)
+        self.assertEqual(segments[0]["text"], "Hear that?")
+
+    def test_rolling_cue_yields_only_the_new_line(self):
+        """滚动缓冲的第二条 cue 把上一条又抄了一遍，只该取新增的那行。"""
+        segments, _, meta = MODULE.parse_cue_subtitles(self.ROLLING_VTT, source="vtt")
+        self.assertEqual(segments[2]["text"], "That's nothing.")
+        self.assertEqual(meta["rolling_cues_merged"], 1)
+
+    def test_whisper_style_srt_is_left_alone(self):
+        """Whisper SRT 每条是完整的独立段，不是滚动结构，一个字都不能动。
+
+        早先的滚轮判定用「上一行是前缀」+「都出现过」两条，太松：
+        实测 60 份中文 Whisper SRT 里有 31 处被误判成滚动而被吞掉（如「对」「嗯」连着重复）。
+        """
+        srt = (
+            "1\n00:00:00,000 --> 00:00:02,520\n怎么让自己一天专注至少8个小时\n\n"
+            "2\n00:00:02,520 --> 00:00:04,300\n不废话直接开始\n\n"
+            "3\n00:00:04,300 --> 00:00:06,100\n第一遍看不建议拉进度条\n"
+        )
+        segments, _, meta = MODULE.parse_cue_subtitles(srt, source="srt")
+        self.assertEqual([s["text"] for s in segments],
+                         ["怎么让自己一天专注至少8个小时", "不废话直接开始", "第一遍看不建议拉进度条"])
+        self.assertEqual(meta["rolling_cues_merged"], 0)
+
+    def test_srt_index_numbers_are_not_part_of_the_text(self):
+        srt = "1\n00:00:00,000 --> 00:00:02,000\n正文内容\n"
+        segments, _, _ = MODULE.parse_cue_subtitles(srt, source="srt")
+        self.assertEqual(segments[0]["text"], "正文内容")
+
+    def test_vtt_cue_identifiers_and_header_are_skipped(self):
+        vtt = (
+            "WEBVTT\nKind: captions\nLanguage: en\n\n"
+            "cue-00001\n00:00:01.000 --> 00:00:03.000\nHello there\n\n"
+            "NOTE 这一行是注释\n\n"
+            "cue-00002\n00:00:03.000 --> 00:00:05.000\nSecond line\n"
+        )
+        segments, _, _ = MODULE.parse_cue_subtitles(vtt, source="vtt")
+        self.assertEqual([s["text"] for s in segments], ["Hello there", "Second line"])
+
+    def test_overlapping_cues_are_clipped_to_keep_the_timeline_monotonic(self):
+        """YouTube 自动字幕实测 91% 的相邻 cue 互相重叠，不裁取帧点会落在两句之间。"""
+        srt = (
+            "1\n00:00:00,000 --> 00:00:05,000\n第一句\n\n"
+            "2\n00:00:03,000 --> 00:00:08,000\n第二句\n\n"
+            "3\n00:00:07,000 --> 00:00:10,000\n第三句\n"
+        )
+        segments, _, meta = MODULE.parse_cue_subtitles(srt, source="srt")
+        self.assertEqual(meta["clipped_overlaps"], 2)
+        self.assertEqual([(s["start"], s["end"]) for s in segments],
+                         [(0.0, 3.0), (3.0, 7.0), (7.0, 10.0)])
+        for left, right in zip(segments, segments[1:]):
+            self.assertLessEqual(left["end"], right["start"])
+
+    def test_degenerate_cues_are_dropped_after_clipping(self):
+        """裁剪后 end 不再大于 start 的 cue 没有可用时长，必须丢掉而不是留个空档。"""
+        srt = (
+            "1\n00:00:00,000 --> 00:00:05,000\n有内容的一句\n\n"
+            "2\n00:00:00,000 --> 00:00:00,500\n夹在里面的碎块\n"
+        )
+        segments, _, _ = MODULE.parse_cue_subtitles(srt, source="srt")
+        self.assertTrue(all(s["end"] > s["start"] for s in segments))
+
+    def test_load_transcript_accepts_vtt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "talk.en.vtt"
+            path.write_text(self.ROLLING_VTT, encoding="utf-8")
+            segments, duration, meta = MODULE.load_transcript(path)
+            self.assertTrue(segments)
+            self.assertEqual(meta["source"], "vtt")
+            self.assertAlmostEqual(duration, 24.83, places=2)
+
+    def test_load_transcript_rejects_timestamp_free_text(self):
+        """没有时间戳的纯文本定位不到取帧点，必须明确报错并指路，不能猜。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plain.txt"
+            path.write_text("这是一段没有时间戳的转写文本", encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                MODULE.load_transcript(path)
+            self.assertIn("时间戳", str(caught.exception))
+
+
+class DedupeTests(unittest.TestCase):
+    """挑出的每一组都要出成一张图，所以两组之间不能共用同一行。"""
+
+    def _windows(self, count=10, size=5, score=0.5):
+        lines = [
+            {"start": index * 3.0, "end": index * 3.0 + 2.6, "text": f"第{index}句内容"}
+            for index in range(count)
+        ]
+        windows = MODULE.build_windows(lines, low=size, high=size)
+        for window in windows:
+            window["score"] = {"total": score}
+        return windows
+
+    def test_new_window_may_not_start_inside_an_already_chosen_one(self):
+        """窗口是逐行滑出来的，嵌套重叠是最常见的重复形态。
+
+        这里是旧规则漏掉的样例：窗口 0 被选中后，窗口 4 共享 1/5 行（0.2 < 0.34 阈值），
+        索引又差 4（旧阈值为 3），于是两道检查都放过——但它整段压在窗口 0 里面。
+        """
+        windows = self._windows()
+        chosen = MODULE.pick_windows(windows, top=5)
+        for picked in chosen:
+            for other in chosen:
+                if other is picked:
+                    continue
+                inside = picked["index"] <= other["index"] < picked["index"] + picked["size"]
+                self.assertFalse(
+                    inside,
+                    f"窗口 {other['index']} 落在已选窗口 {picked['index']}"
+                    f"（{picked['index']}–{picked['index'] + picked['size'] - 1}）内部",
+                )
+
+    def test_no_line_is_shared_by_two_selected_windows(self):
+        """12 行、窗口 5 行时，互不共享的窗口最多只能放下 2 个（0–4 与 5–9）。
+
+        这里同时是「去重不能严到选不出东西」的下界守卫：两个都必须选出来。
+        """
+        windows = self._windows(count=12)
+        chosen = MODULE.pick_windows(windows, top=5)
+        self.assertEqual(len(chosen), 2, "去重过严或过松")
+        for index, left in enumerate(chosen):
+            for right in chosen[index + 1:]:
+                shared = set(id(line) for line in left["lines"]) & set(
+                    id(line) for line in right["lines"]
+                )
+                self.assertFalse(shared, f"共享了 {len(shared)} 行")
+
+    def test_short_video_still_yields_at_least_one_window(self):
+        """只有 4 行的小样本也必须能选出东西，不能因为去重规则空手而归。"""
+        windows = self._windows(count=4, size=4)
+        self.assertEqual(len(MODULE.pick_windows(windows, top=5)), 1)
+
+    def test_dedupe_never_drops_the_best_window(self):
+        """去重只在重复之间取舍，绝不能把分数最高的那组挤掉。"""
+        windows = self._windows(count=12)
+        winner = windows[0]
+        winner["score"] = {"total": 0.99}
+        chosen = MODULE.pick_windows(windows, top=5)
+        self.assertIn(winner, chosen)
+
 
 def ffmpeg_exe():
     import shutil
