@@ -10,18 +10,43 @@
 ## 一句话流程
 
 ```bash
+# 只选句，产出候选和时间点文件
 python3 "<SKILL_DIR>/scripts/select_quotes.py" pick TRANSCRIPT.json \
   --out OUT_DIR --top 5
 
-# 或整库批处理
+# 一条命令选句 + 出图
+python3 "<SKILL_DIR>/scripts/select_quotes.py" pick TRANSCRIPT.json \
+  --out OUT_DIR --top 5 --render --render-mode script \
+  --aspect 9:16 --width 1080 --frame-bottom 0.55 --band-center 0.5 \
+  --font "/System/Library/Fonts/STHeiti Medium.ttc"
+
+# 整库批处理（视频和转写同名同目录时会自动配对）
 python3 "<SKILL_DIR>/scripts/select_quotes.py" batch TRANSCRIPT_ROOT \
-  --out OUT_DIR --top 5
+  --out OUT_DIR --top 5 --render --render-mode native \
+  --band-top 0.76 --band-bottom 0.90
 ```
 
 `TRANSCRIPT` 支持 `.transcript.json`（faster-whisper / openai-whisper 的 `segments` 结构）、
 普通 `.json`（数组或带 `segments` 的对象）、`.srt`。
 **纯 `.txt` 会被拒绝**——没有时间戳就无法定位取帧点。
-给了 `--video` 时用 FFmpeg 读真实时长来校正清洗边界，没给则用文字稿自带 `duration`。
+
+## 视频自动配对与时长校正
+
+文字稿通常和视频放在一起（`X.mp4` 旁边就是 `X.mp4.transcript.json`），
+所以 `sibling_video()` 会自动找到它，**批处理时不必手工指定视频路径**。
+
+找到视频后，**取帧时间一律以视频实测时长为准，不用转写自带的 `duration`**。
+这不是洁癖，是实测的必需项：转写声明的时长会与视频不符。
+
+实测踩过：转写声明 20 秒、视频实际只有 3 秒，选出的时间点全部越界，
+渲染器以「必须小于视频时长」拒绝，一张图都出不来。
+只要跑一次带 `--render` 的批处理就会暴露这个错位。
+
+`candidates.json` 里记了 `duration_source`、`declared_duration` 和 `duration_drift`，
+`审阅表.md` 也会写明时长来源与偏差——**偏差很大的那几期值得回头看一眼转写是否可信**。
+
+找不到同名视频时，标注为「时间点未经真实时长校正」，并在 `--render` 时报错跳过，
+不影响候选与时间点文件的产出。
 
 产出（每期视频一个目录）：
 
@@ -33,6 +58,7 @@ python3 "<SKILL_DIR>/scripts/select_quotes.py" batch TRANSCRIPT_ROOT \
 | `script_lines.json` | 脚本字幕模式的索引（数组） |
 | `scripts/NN_标题.json` | 脚本字幕模式真正要喂的文件，**一张图一个** |
 | `渲染脚本字幕.sh` | 生成好的渲染命令，改好 `VIDEO` 即可跑 |
+| `images/` | 加了 `--render` 才产出：真正渲染好的图片 |
 
 批处理额外产出 `全局精选.md` / `全局精选.json`：跨所有视频的总分排序。
 
@@ -59,7 +85,7 @@ python3 "<SKILL_DIR>/scripts/select_quotes.py" batch TRANSCRIPT_ROOT \
 
 从 50,557 个窗口压到 291 条，压缩比约 174:1。
 
-## 三个必须知道的数据事实
+## 四个必须知道的数据事实
 
 这些是实测结论，直接决定了流程为什么长这样。
 
@@ -91,6 +117,11 @@ python3 "<SKILL_DIR>/scripts/select_quotes.py" batch TRANSCRIPT_ROOT \
 
 注意：这类幻觉段的 `start` 往往**刚好卡在总时长以内**（217.70 < 217.73），
 所以真正命中的通常是套话规则或跨度规则。「超出总时长」那条是兜底，不是主力。
+
+### 4. 转写声明的时长本身可能是错的
+
+同一次幻觉会让末段 `end` 多出几十秒，`duration` 字段也可能与视频对不上。
+所以取帧时间**一律以视频实测时长为准**，见下面的「视频自动配对与时长校正」。
 
 ## 六维打分
 

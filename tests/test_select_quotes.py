@@ -229,5 +229,192 @@ class CliTests(unittest.TestCase):
             self.assertGreater(ranking["stats"]["selected"], 0)
 
 
+class SiblingVideoTests(unittest.TestCase):
+    def test_finds_video_next_to_transcript(self):
+        """流水线把 X.mp4 和 X.mp4.transcript.json 放在一起，批处理要认得出兄弟文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            video = folder / "X.mp4"
+            video.write_bytes(b"stub")
+            transcript = folder / "X.mp4.transcript.json"
+            transcript.write_text("{}", encoding="utf-8")
+            self.assertEqual(MODULE.sibling_video(transcript), video)
+
+    def test_returns_none_when_video_is_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "lonely.mp4.transcript.json"
+            transcript.write_text("{}", encoding="utf-8")
+            self.assertIsNone(MODULE.sibling_video(transcript))
+
+
+def ffmpeg_exe():
+    import shutil
+
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001 - 探测不到就跳过渲染类测试
+        return None
+
+
+def cjk_font():
+    for path in [
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    ]:
+        if Path(path).exists():
+            return path
+    return None
+
+
+class RenderTests(unittest.TestCase):
+    """--render 会真的调起 FFmpeg 和 Pillow，跑通它才算端到端可用。
+
+    只在环境确实缺东西时跳过（没有 FFmpeg / 没有中日韩字体）。
+    除此之外一律必须通过——否则真实回归会被伪装成跳过。
+    """
+
+    # 无信号词的平淡句，放在前 10 行
+    BLAND = [
+        "会议室的灯忽明忽暗", "窗外刚好下起小雨", "桌上的水杯已经凉透",
+        "墙上挂着一幅旧地图", "椅子发出轻微的声响", "远处传来一阵脚步声",
+        "空调的风向换了两次", "笔记本翻到了空白页", "走廊里的灯依次亮起",
+        "时间一分一秒过去",
+    ]
+    # 带信号词的强句，放在后面——故意让它们落在视频时长之外
+    STRONG = [
+        "真正的核心是这个系统没有闭环", "而不是把责任推给一线同事",
+        "因为成本上升会挤压利润空间", "所以必须提前布局",
+        "很多人以为这是效率问题其实是分配问题", "关键在于把指标拆到可执行",
+        "上线一个月被罚了500万", "能提升百分之三十的转化",
+        "千万不要等到出事才补救", "本质上这是一场认知升级",
+        "什么叫真正的护城河", "应该先定标准再谈执行",
+        "真相是多数团队都搞反了", "归根结底还是要看现金流",
+    ]
+
+    def make_fixture(self, folder, seconds=30):
+        engine = ffmpeg_exe()
+        if engine is None:
+            self.skipTest("没有可用的 FFmpeg")
+        video = folder / "clip.mp4"
+        subprocess.run(
+            [engine, "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate=10",
+             "-t", str(seconds), "-c:v", "mpeg4", "-pix_fmt", "yuv420p", str(video)],
+            check=True, capture_output=True,
+        )
+        return video
+
+    def make_calibration_transcript(self, folder, declared=90.0):
+        """转写声明 90 秒，视频只有 30 秒，且强句全部落在 30 秒之后。
+
+        这个错位是刻意的：只有用视频实测时长校正，才会丢掉 30 秒之后的段，
+        时间点才落在视频内。沿用转写声明值就会选出 57 秒处的时间点，
+        被渲染器以「必须小于视频时长」拒绝——这正是实测踩到的那个 bug。
+        """
+        lines = self.BLAND + self.STRONG
+        transcript = {
+            "text": "".join(lines), "duration": declared,
+            "backend": "test", "model": "test",
+            "segments": make_segments(lines, step=2.5, span=2.2),
+        }
+        source = folder / "clip.mp4.transcript.json"
+        source.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+        return source
+
+    def test_render_script_mode_produces_images_from_sibling_video(self):
+        font = cjk_font()
+        if font is None:
+            self.skipTest("没有可用的中日韩字体")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            self.make_fixture(folder)
+            source = self.make_calibration_transcript(folder)
+            out = folder / "out"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "pick", str(source), "--out", str(out),
+                 "--top", "2", "--render", "--render-mode", "script",
+                 "--aspect", "9:16", "--width", "540", "--font", font],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            images = sorted((out / "images").glob("*.jpg"))
+            self.assertTrue(images, result.stdout + result.stderr)
+            self.assertIn("出图", result.stdout)
+            self.assertNotIn("⚠", result.stdout, result.stdout)
+
+    def test_render_native_mode_produces_images(self):
+        if cjk_font() is None:
+            self.skipTest("没有可用的中日韩字体")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            self.make_fixture(folder)
+            source = self.make_calibration_transcript(folder)
+            out = folder / "out"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "pick", str(source), "--out", str(out),
+                 "--top", "2", "--render", "--render-mode", "native",
+                 "--band-top", "0.70", "--band-bottom", "0.95"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(sorted((out / "images").glob("*.jpg")), result.stdout + result.stderr)
+
+    def test_real_video_duration_overrides_transcript_duration(self):
+        """转写声明的时长会与视频不符；取帧必须以视频实测时长为准。"""
+        engine = ffmpeg_exe()
+        if engine is None:
+            self.skipTest("没有可用的 FFmpeg")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            self.make_fixture(folder, seconds=30)
+            source = self.make_calibration_transcript(folder, declared=90.0)
+
+            out = folder / "out"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "pick", str(source), "--out", str(out), "--top", "2"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads((out / "candidates.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["duration_source"], "video")
+            self.assertAlmostEqual(payload["duration"], 30.0, delta=0.6)
+            self.assertAlmostEqual(payload["duration_drift"], 60.0, delta=0.6)
+            manifest = json.loads((out / "native_manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["images"])
+            for image in manifest["images"]:
+                self.assertLess(image["times"][-1], 30.0)
+
+    def test_render_reports_missing_sibling_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            lines = ["先交代一下背景情况", "政策影响了整个市场结构",
+                     "企业必须重新评估自己的定位", "因为成本上升会挤压利润空间",
+                     "所以结论是需要提前布局", "而不是等到变化发生之后"]
+            transcript = {
+                "text": "".join(lines), "duration": 20.0,
+                "backend": "test", "model": "test",
+                "segments": make_segments(lines),
+            }
+            source = folder / "orphan.mp4.transcript.json"
+            source.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+            out = folder / "out"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "pick", str(source), "--out", str(out),
+                 "--top", "2", "--render"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("找不到与", result.stdout)
+            # 出图失败不影响候选与时间点产出
+            self.assertTrue((out / "native_manifest.json").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

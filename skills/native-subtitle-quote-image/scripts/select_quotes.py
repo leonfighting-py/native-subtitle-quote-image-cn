@@ -491,9 +491,19 @@ def render_commands(scripts: list[dict], video: str | None) -> str:
 def render_review(
     source: str, meta: dict, duration: float | None, dropped: list[dict],
     windows: list[dict], chosen: list[dict], top: int,
+    duration_source: str = "transcript", declared: float | None = None,
+    drift: float | None = None,
 ) -> str:
     out = [f"# 候选审阅表：{source}", ""]
     out.append(f"- 总时长：{duration:.2f}s" if duration else "- 总时长：未知")
+    if duration_source == "video":
+        out.append(
+            f"- 时长来源：视频实测（转写声明 {declared:.2f}s，偏差 {drift:+.2f}s）"
+            if declared and drift is not None
+            else "- 时长来源：视频实测"
+        )
+    else:
+        out.append("- 时长来源：转写自带（没找到同名视频，时间点未经真实时长校正）")
     out.append(f"- 转写模型：{meta.get('model') or '未知'}")
     out.append(f"- 清洗丢弃：{len(dropped)} 段")
     out.append(f"- 候选窗口：{len(windows)} 个，选出 {len(chosen)} 个")
@@ -576,10 +586,25 @@ def probe_duration(video: Path) -> float | None:
     return hours * 3600 + minutes * 60 + seconds + centis / 100
 
 
-def process_one(transcript_path: Path, out_dir: Path, top: int, video: Path | None = None) -> dict:
-    segments, duration, meta = load_transcript(transcript_path)
-    if video is not None:
-        duration = probe_duration(video) or duration
+def process_one(
+    transcript_path: Path, out_dir: Path, top: int, video: Path | None = None, options=None
+) -> dict:
+    segments, declared, meta = load_transcript(transcript_path)
+
+    # 真实视频时长是取帧的唯一权威。转写自带的 duration 只是 Whisper 的判断，
+    # 实测会与视频不符（59 期中 11 期末段越界），所以只要找得到视频就用它校正。
+    target_video = video or sibling_video(transcript_path)
+    duration = declared
+    duration_source = "transcript"
+    if target_video is not None:
+        probed = probe_duration(target_video)
+        if probed:
+            duration = probed
+            duration_source = "video"
+    drift = None
+    if declared and duration and duration > 0:
+        drift = round(declared - duration, 2)
+
     clean, dropped = sanitize(segments, duration)
     if len(clean) < 4:
         raise SystemExit(f"清洗后只剩 {len(clean)} 段，不足以选句")
@@ -597,7 +622,11 @@ def process_one(transcript_path: Path, out_dir: Path, top: int, video: Path | No
         json.dumps(
             {
                 "source": str(transcript_path),
+                "video": str(target_video) if target_video else None,
                 "duration": duration,
+                "duration_source": duration_source,
+                "declared_duration": declared,
+                "duration_drift": drift,
                 "meta": meta,
                 "lines": len(lines),
                 "dropped": dropped,
@@ -636,15 +665,31 @@ def process_one(transcript_path: Path, out_dir: Path, top: int, video: Path | No
     shell.write_text(render_commands(bundle["script_lines"], str(video) if video else None), encoding="utf-8")
     shell.chmod(0o755)
     (out_dir / "审阅表.md").write_text(
-        render_review(transcript_path.name, meta, duration, dropped, windows, chosen, top),
+        render_review(
+            transcript_path.name, meta, duration, dropped, windows, chosen, top,
+            duration_source, declared, drift,
+        ),
         encoding="utf-8",
     )
+
+    rendered: list[Path] = []
+    render_failures: list[str] = []
+    if options is not None and getattr(options, "render", False):
+        if target_video is None:
+            render_failures.append(
+                f"找不到与 {transcript_path.name} 同名的视频，跳过渲染"
+            )
+        else:
+            rendered, render_failures = render_selected(bundle, target_video, out_dir, options)
+
     return {
         "chosen": len(chosen),
         "candidates": len(windows),
         "dropped": len(dropped),
         "lines": len(lines),
         "out": out_dir,
+        "rendered": len(rendered),
+        "render_failures": render_failures,
     }
 
 
@@ -714,6 +759,110 @@ def discover_transcripts(root: Path) -> list[Path]:
     return found or sorted(root.rglob("*.json"))
 
 
+def sibling_video(transcript: Path) -> Path | None:
+    """找与文字稿同名的视频。
+
+    douyin-asr-pipeline 这类流水线把 X.mp4 和 X.mp4.transcript.json 放在一起，
+    所以批处理时不必手工指定视频路径——认得出兄弟文件就能直接出图。
+    """
+    for suffix in (".transcript.json", ".transcript.srt", ".json", ".srt"):
+        if transcript.name.endswith(suffix):
+            stem = transcript.name[: -len(suffix)]
+            candidate = transcript.parent / stem
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def renderer_flags(options, mode: str) -> list[str]:
+    """把通用版式选项翻译成渲染器的参数。只做转发，不重新解释语义。"""
+    flags: list[str] = []
+    if options.aspect:
+        flags += ["--aspect", options.aspect]
+    if options.width:
+        flags += ["--width", str(options.width)]
+    if options.layout:
+        flags += ["--layout", options.layout]
+    if options.font:
+        flags += ["--font", options.font]
+    if mode == "native":
+        if options.band_top is not None:
+            flags += ["--band-top", str(options.band_top)]
+        if options.band_bottom is not None:
+            flags += ["--band-bottom", str(options.band_bottom)]
+    else:
+        if options.band_center is not None:
+            flags += ["--band-center", str(options.band_center)]
+        if options.frame_top is not None:
+            flags += ["--frame-top", str(options.frame_top)]
+        if options.frame_bottom is not None:
+            flags += ["--frame-bottom", str(options.frame_bottom)]
+    return flags
+
+
+def render_selected(bundle: dict, video: Path, out_dir: Path, options) -> tuple[list[Path], list[str]]:
+    """调用渲染器把选中的候选真正画成图。失败不抛异常，收集起来一并报告。"""
+    import subprocess
+
+    renderer = Path(__file__).resolve().parent / "native_subtitle_stitch.py"
+    produced: list[Path] = []
+    failures: list[str] = []
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    if options.render_mode == "native":
+        command = [
+            sys.executable, str(renderer), "render", str(video),
+            "--manifest", str(out_dir / "native_manifest.json"),
+            "--out-dir", str(images_dir),
+            *renderer_flags(options, "native"),
+        ]
+        if options.overwrite:
+            command.append("--overwrite")
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            failures.append((result.stdout + result.stderr).strip()[:300])
+        else:
+            produced += sorted(images_dir.glob("*.jpg"))
+        return produced, failures
+
+    for item in bundle["script_lines"]:
+        safe = re.sub(r"[^\w\u4e00-\u9fff]", "_", item["title"])
+        target = images_dir / f"{item['order']:02d}_{safe}.jpg"
+        command = [
+            sys.executable, str(renderer), "render-script", str(video),
+            "--script", str(out_dir / "scripts" / f"{item['order']:02d}_{safe}.json"),
+            "--out", str(target),
+            *renderer_flags(options, "script"),
+        ]
+        if options.overwrite:
+            command.append("--overwrite")
+        result = subprocess.run(command, capture_output=True, text=True)
+        if target.is_file():
+            produced.append(target)
+        else:
+            failures.append(f"{target.name}: {(result.stdout + result.stderr).strip()[:200]}")
+    return produced, failures
+
+
+def add_render_options(parser) -> None:
+    """加出图相关的开关。默认不出图，只产出候选与时间点文件。"""
+    parser.add_argument("--render", action="store_true",
+                        help="选出候选后直接调用渲染器出图")
+    parser.add_argument("--render-mode", choices=["script", "native"], default="script",
+                        help="script: 把台词画到帧上；native: 保留画面已有字幕（默认 script）")
+    parser.add_argument("--aspect", help="如 3:4 / 9:16 / 1:1")
+    parser.add_argument("--width", type=int)
+    parser.add_argument("--layout", choices=["fixed", "natural"])
+    parser.add_argument("--font", help="中文字体文件；竖屏建议显式指定")
+    parser.add_argument("--band-top", type=float)
+    parser.add_argument("--band-bottom", type=float)
+    parser.add_argument("--band-center", type=float)
+    parser.add_argument("--frame-top", type=float)
+    parser.add_argument("--frame-bottom", type=float)
+    parser.add_argument("--overwrite", action="store_true")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="从带时间戳文字稿里自动挑选值得传播的句子")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -723,6 +872,7 @@ def main() -> None:
     one.add_argument("--video", type=Path)
     one.add_argument("--out", type=Path, required=True)
     one.add_argument("--top", type=int, default=3, help="最多产出几张图，默认 3")
+    add_render_options(one)
 
     many = sub.add_parser("batch", help="批量处理一个目录下的全部文字稿")
     many.add_argument("repo", type=Path)
@@ -731,17 +881,22 @@ def main() -> None:
     many.add_argument("--per-category", type=int, default=None,
                       help="每个顶层分类最多处理几个视频，默认全部")
     many.add_argument("--limit", type=int, default=None, help="全局最多处理几个视频")
+    add_render_options(many)
 
     args = parser.parse_args()
 
     if args.command == "pick":
         if not args.transcript.exists():
             raise SystemExit(f"找不到文字稿：{args.transcript}")
-        result = process_one(args.transcript, args.out, args.top, args.video)
+        result = process_one(args.transcript, args.out, args.top, args.video, args)
         print(
             f"{result['lines']} 行 -> 候选 {result['candidates']} 个 -> "
             f"选出 {result['chosen']} 组；丢弃 {result['dropped']} 段；输出 {result['out']}"
         )
+        if args.render:
+            print(f"出图 {result['rendered']} 张")
+            for message in result["render_failures"][:5]:
+                print(f"  ⚠ {message}")
         return
 
     root = args.repo.expanduser().resolve()
@@ -758,6 +913,7 @@ def main() -> None:
         by_category.setdefault(category, []).append(path)
 
     processed = 0
+    rendered_total = 0
     failures: list[tuple[str, str]] = []
     for category in sorted(by_category):
         items = by_category[category]
@@ -768,18 +924,24 @@ def main() -> None:
                 break
             target = args.out / category / path.name.replace(".transcript.json", "")
             try:
-                result = process_one(path, target, args.top)
+                result = process_one(path, target, args.top, None, args)
             except SystemExit as exc:
                 failures.append((path.name[:50], str(exc)))
                 continue
             processed += 1
-            print(f"[{processed}] {category}/{path.name[:34]} -> {result['chosen']} 组 / {result['lines']} 行")
+            rendered_total += result["rendered"]
+            note = f" / 出图 {result['rendered']}" if args.render else ""
+            print(f"[{processed}] {category}/{path.name[:34]} -> {result['chosen']} 组 / {result['lines']} 行{note}")
+            for message in result["render_failures"][:2]:
+                failures.append((f"{path.name[:30]} 渲染", message))
         if args.limit is not None and processed >= args.limit:
             break
 
     print(f"\n处理 {processed} 个视频，输出到 {args.out}")
+    if args.render:
+        print(f"共出图 {rendered_total} 张")
     if failures:
-        print(f"跳过 {len(failures)} 个：")
+        print(f"跳过/报错 {len(failures)} 条：")
         for name, reason in failures[:10]:
             print(f"  - {name}: {reason}")
 

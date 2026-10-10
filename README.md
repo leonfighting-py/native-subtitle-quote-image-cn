@@ -65,17 +65,25 @@ bili-demo.mp4 1280x720  dur= 130.82 fps=30.0  margin=0.5000
 **输入带时间戳的文字稿，输出排好序的候选清单和可直接渲染的时间点文件。**
 
 ```bash
-# 单期
+# 只选句，产出候选清单与时间点文件
 python3 skills/native-subtitle-quote-image/scripts/select_quotes.py pick \
   video.mp4.transcript.json --out out/ --top 5
 
-# 整库
+# 一条命令选句 + 出图（视频与转写同名同目录时自动配对）
+python3 skills/native-subtitle-quote-image/scripts/select_quotes.py pick \
+  video.mp4.transcript.json --out out/ --top 5 \
+  --render --render-mode script --aspect 9:16 --width 1080 \
+  --frame-bottom 0.55 --band-center 0.5
+
+# 整库批处理
 python3 skills/native-subtitle-quote-image/scripts/select_quotes.py batch \
-  transcripts/ --out out/ --top 5
+  transcripts/ --out out/ --top 5 --render --render-mode native \
+  --band-top 0.76 --band-bottom 0.90
 ```
 
 产出 `审阅表.md`（人在几十条里做取舍）、`candidates.json`、`native_manifest.json`、
-`scripts/NN_标题.json` 与 `渲染脚本字幕.sh`；批处理额外产出跨视频的 `全局精选.md`。
+`scripts/NN_标题.json` 与 `渲染脚本字幕.sh`；加 `--render` 另有 `images/`；
+批处理额外产出跨视频的 `全局精选.md`。
 
 实测规模与耗时：
 
@@ -83,22 +91,23 @@ python3 skills/native-subtitle-quote-image/scripts/select_quotes.py batch \
 覆盖视频     59 期（568 分钟）
 候选窗口     50,557
 入选         291
-耗时         约 4 秒
+耗时         约 4 秒（不含出图）
 ```
 
 设计上刻意**不让模型直接读整篇文字稿**——那是几十万字、批处理跑不动，也失去逐句回溯能力。
 脚本先用确定性规则清洗、切窗、打分、去重，把工作量压到 174:1，模型只在最后判断语义。
 
-实现过程中查清并处理的四个中文长视频特性：
+实现过程中查清并处理的五个中文长视频特性：
 
 | 发现 | 实测数据 | 处理方式 |
 |---|---|---|
 | 转写**没有标点** | 56/59 期零标点 | 不靠标点切句 |
 | 转写段**几乎没有停顿** | 段间停顿中位 0.00s，>0.5s 只占 1/648 | 不靠停顿切句；原始段本身就是合格字幕行（中位 14 字 / 2.52s） |
 | 末段**幻觉超出总时长** | 11/59 期，如 `[217.70→247.68] 感谢观看` 而总时长为 217.73s | 三条规则兜底清洗；否则会撞上渲染器的硬校验 |
+| 转写**声明的时长本身可能是错的** | 实测踩到声明 20s / 视频 3s | 一律以视频实测时长校正；否则时间点越界、一张图都出不来 |
 | 序数词**冒充数字** | 「第一」「第二个」无处不在 | 信号词只认真正的数量；否则过半候选被误标、排序尽毁 |
 
-末尾两项都补了回归测试并做反向验证。竖屏素材在脚本模式下的**字幕重影**问题也在文档中给出
+后三项都补了回归测试并做反向验证。竖屏素材在脚本模式下的**字幕重影**问题也在文档中给出
 实测解法（`--frame-bottom 0.55 --band-center 0.5`）。
 
 ### 版本号
@@ -147,7 +156,8 @@ python3 skills/native-subtitle-quote-image/scripts/check_environment.py --url-mo
 python3 -m unittest discover -s tests
 ```
 
-55 个用例，覆盖布局几何、字幕带识别、重复帧拦截、清洗去重、打分信号、CLI 集成与两处修复的回归。
+61 个用例，覆盖布局几何、字幕带识别、重复帧拦截、清洗去重、打分信号、时长校正、
+两个字幕模式的端到端出图，以及三处修复的回归。
 
 CI（[`.github/workflows/tests.yml`](.github/workflows/tests.yml)）在每次 push 与 PR 时
 于 Python 3.10 和 3.13 上跑全套测试，并检查 CLI 可用性。
