@@ -46,6 +46,7 @@ python3 "<SKILL_DIR>/scripts/check_update.py" --json
 - **B站、抖音等中国大陆平台**：先读 [references/cn-platforms.md](references/cn-platforms.md)。国内平台的风控和字幕形态与 YouTube 不同，不要套用上面那份文档的命令。两条必须先记住的结论：B站的 `danmaku` 是弹幕不是字幕轨；抖音当前在 yt-dlp 侧完全不可用，不要反复试 Cookie，改用本地视频模式。
 - **源视频是竖屏或方形**：先读 [references/portrait-and-vertical.md](references/portrait-and-vertical.md)。默认字幕带 `0.78–0.96` 是按横屏字幕位置设计的，套在竖屏素材上会圈不到字幕；直接用 `--aspect 3:4` 还会裁掉约 38% 的纵向画面。
 - **读长视频 → 选题 → 写文章/帖子 → 配图**：读 [references/end-to-end-workflow.md](references/end-to-end-workflow.md)。
+- **用户不想先看完视频，要求批量自动挑出值得传播的句子并出图**：读 [references/auto-quote-selection.md](references/auto-quote-selection.md)。核心是先用 `scripts/select_quotes.py` 做确定性清洗与排序，把上千句压到几十条候选，再让模型/人复核。**不要把整篇文字稿直接丢给模型让它自由发挥**——那既跑不动批量，也失去可回溯性。
 - **台词条太高、间隔太宽、缺少美感**：读 [references/visual-style.md](references/visual-style.md)。
 - **本地短视频且时间点已确定**：直接执行下面的核心流程。
 

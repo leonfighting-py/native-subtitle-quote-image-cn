@@ -131,6 +131,11 @@ python3 "<SKILL_DIR>/scripts/native_subtitle_stitch.py" sample VIDEO \
 
 ## 阶段 4：用文字稿选题，再核对文字用途
 
+> 用户不想先看完视频，或要一次处理很多期时，先跑
+> [auto-quote-selection.md](auto-quote-selection.md) 里的 `select_quotes.py`：
+> 它把这一步的清洗、切窗、打分、去重做成确定性脚本，产出 `审阅表.md` 供复核。
+> 下面这段是手工做同一个决策时的判据。
+
 字幕轨或 Whisper 文字稿首先用来快速回答：
 
 - 视频有哪些值得传播的独立观点；

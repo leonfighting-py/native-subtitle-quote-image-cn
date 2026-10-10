@@ -39,3 +39,6 @@ jobs:
           python skills/native-subtitle-quote-image/scripts/native_subtitle_stitch.py --help
           python skills/native-subtitle-quote-image/scripts/native_subtitle_stitch.py sample --help
           python skills/native-subtitle-quote-image/scripts/native_subtitle_stitch.py render-script --help
+          python skills/native-subtitle-quote-image/scripts/select_quotes.py --help
+          python skills/native-subtitle-quote-image/scripts/select_quotes.py pick --help
+          python skills/native-subtitle-quote-image/scripts/select_quotes.py batch --help
