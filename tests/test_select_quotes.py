@@ -487,6 +487,116 @@ class DedupeTests(unittest.TestCase):
         self.assertIn(winner, chosen)
 
 
+class JoinTests(unittest.TestCase):
+    """字幕是一句一句切开的，拼回整段时要按书写系统还原空格。"""
+
+    def test_cjk_parts_are_glued_without_space(self):
+        """中文转写没有标点也没有停顿，段与段直接相连，多一个空格就是错的。"""
+        self.assertEqual(
+            MODULE.join_parts(["这种逆差在正常情况下", "会导致货币贬值和经济困难"]),
+            "这种逆差在正常情况下会导致货币贬值和经济困难",
+        )
+
+    def test_latin_parts_are_joined_with_a_space(self):
+        """英语少一个空格就粘连成 `yourconversations`，而且会一路带进交付物。"""
+        self.assertEqual(
+            MODULE.join_parts(["looks like 10% of your", "conversations yeah I thought"]),
+            "looks like 10% of your conversations yeah I thought",
+        )
+
+    def test_mixed_script_switches_at_the_boundary(self):
+        """中文里夹英文术语要按相邻字符判断，不能整段一刀切。"""
+        self.assertEqual(MODULE.join_parts(["这是 ChatGPT", "的最新版本"]), "这是 ChatGPT的最新版本")
+        self.assertEqual(MODULE.join_parts(["we use GPT", "models here"]), "we use GPT models here")
+
+    def test_empty_parts_are_skipped(self):
+        self.assertEqual(MODULE.join_parts(["甲", "", "   ", "乙"]), "甲乙")
+        self.assertEqual(MODULE.join_parts([]), "")
+
+    def test_window_text_keeps_word_boundaries(self):
+        """窗口 text 会被当成候选标题和全局精选的原文，必须可直接阅读。"""
+        lines = [
+            {"start": 0.0, "end": 2.0, "text": "looks like 10% of your"},
+            {"start": 2.0, "end": 4.0, "text": "conversations yeah I thought"},
+            {"start": 4.0, "end": 6.0, "text": "Twitter like love is blind"},
+            {"start": 6.0, "end": 8.0, "text": "drinking game like take a shot"},
+        ]
+        window = MODULE.build_windows(lines, low=4, high=4)[0]
+        self.assertIn("your conversations", window["text"])
+        self.assertNotIn("yourconversations", window["text"])
+
+
+class LanguageTrackTests(unittest.TestCase):
+    """一次 `--sub-langs "zh.*,en.*"` 会给同一支视频落下好几条轨。"""
+
+    def test_original_track_outranks_the_rest(self):
+        ranks = {
+            name: MODULE.language_rank(name)
+            for name in ["T_[id].en-orig", "T_[id].en", "T_[id].zh-Hans",
+                         "T_[id].en-en", "T_[id].zh-Hans-en", "X.mp4"]
+        }
+        self.assertLess(ranks["T_[id].en-orig"], ranks["T_[id].en"])
+        self.assertLess(ranks["T_[id].en"], ranks["T_[id].en-en"])
+        self.assertLess(ranks["T_[id].zh-Hans"], ranks["T_[id].zh-Hans-en"])
+        # 没有语言码的（Whisper 转写）不受影响
+        self.assertEqual(ranks["X.mp4"][0], 0)
+
+    def test_one_subtitle_per_video_is_kept(self):
+        """实测一个英文视频会落下 en / en-orig / en-en 三份，其中 en-en 与 en 逐字节相同。
+
+        不归并的话同一支视频会被处理三遍，全局精选里重复三次。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            names = ["T_[a].en.srt", "T_[a].en-orig.srt", "T_[a].en-en.srt", "T_[b].en.srt"]
+            for name in names:
+                (folder / name).write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+            found = MODULE.discover_transcripts(folder)
+            self.assertEqual(len(found), 2, [p.name for p in found])
+            self.assertEqual({p.name for p in found},
+                             {"T_[a].en-orig.srt", "T_[b].en.srt"})
+
+    def test_different_videos_are_not_merged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            for name in ["first_[a].en.srt", "second_[b].en.srt"]:
+                (folder / name).write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+            self.assertEqual(len(MODULE.discover_transcripts(folder)), 2)
+
+    def test_whisper_transcript_json_is_untouched(self):
+        """抖音流水线的命名没有语言码，归并规则不能误伤它。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            for name in ["X.mp4.transcript.json", "Y.mp4.transcript.json"]:
+                (folder / name).write_text("{}", encoding="utf-8")
+            found = MODULE.discover_transcripts(folder)
+            self.assertEqual({p.name for p in found},
+                             {"X.mp4.transcript.json", "Y.mp4.transcript.json"})
+
+
+class VideoStemTests(unittest.TestCase):
+    def test_language_code_is_stripped(self):
+        self.assertEqual(MODULE.video_stem_candidates("talk.en"), ["talk.en", "talk"])
+
+    def test_script_variant_and_orig_codes_are_stripped(self):
+        self.assertEqual(MODULE.video_stem_candidates("talk.zh-Hans"), ["talk.zh-Hans", "talk"])
+        self.assertEqual(MODULE.video_stem_candidates("talk.en-orig"), ["talk.en-orig", "talk"])
+
+    def test_dots_inside_the_title_do_not_break_lookup(self):
+        """取标题当文件名之后，标题里的点会把 `split(".")[0]` 截断。"""
+        candidates = MODULE.video_stem_candidates("2024-01-01_A.I. and the future_xyz.en")
+        self.assertIn("2024-01-01_A.I. and the future_xyz", candidates)
+
+    def test_video_is_found_when_the_title_contains_dots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            video = folder / "2024-01-01_A.I. and the future_xyz.mp4"
+            video.write_bytes(b"stub")
+            subtitle = folder / "2024-01-01_A.I. and the future_xyz.en.srt"
+            subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+            self.assertEqual(MODULE.sibling_video(subtitle), video)
+
+
 def ffmpeg_exe():
     import shutil
 

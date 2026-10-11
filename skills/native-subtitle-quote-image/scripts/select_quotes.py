@@ -252,7 +252,7 @@ def parse_cue_subtitles(text: str, source: str = "srt") -> tuple[list[dict], flo
             rolling_merged += 1
         if not tail:
             continue
-        segments.append({"start": start, "end": end, "text": " ".join(tail)})
+        segments.append({"start": start, "end": end, "text": join_parts(tail)})
 
     if not segments:
         raise SystemExit("字幕里没有解析出任何可用字幕块")
@@ -277,6 +277,37 @@ def parse_cue_subtitles(text: str, source: str = "srt") -> tuple[list[dict], flo
             "rolling_cues_merged": rolling_merged,
         },
     )
+
+
+# ---------------------------------------------------------------- 拼接
+
+CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
+
+
+def join_parts(parts: list[str]) -> str:
+    """按书写系统决定拼接方式：相邻有中日韩字符就不加空格，否则加空格。
+
+    字幕是一句一句切开的，拼回整段时必须还原词间空格。
+    中文长视频转写没有标点也没有停顿，段与段直接相连（`这种逆差在正常情况下`
+    接 `会导致货币贬值`），多一个空格就是错的；英语正好相反，
+    `10% of your` 与 `conversations yeah` 之间少一个空格就成了 `yourconversations`
+    ——这个错误会一路带进候选标题和 `全局精选.md` 的原文里。
+
+    逐对判断而不是整段一刀切，混合内容（中文里夹英文品牌名）也能拼对。
+    """
+    out = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if not out:
+            out = part
+            continue
+        if CJK.search(out[-1]) or CJK.search(part[0]):
+            out += part
+        else:
+            out += " " + part
+    return out
 
 
 # ---------------------------------------------------------------- 清洗
@@ -349,7 +380,7 @@ def build_lines(
         if lines and len(lines[-1]["text"]) < min_chars:
             previous = lines[-1]
             if previous["end"] - previous["start"] + (seg["end"] - seg["start"]) <= max_span:
-                previous["text"] = (previous["text"] + text).strip()
+                previous["text"] = join_parts([previous["text"], text])
                 previous["end"] = seg["end"]
                 previous["merged"] = previous.get("merged", 1) + 1
                 continue
@@ -372,7 +403,7 @@ def build_windows(lines: list[dict], low: int = 4, high: int = 6) -> list[dict]:
                     "index": index,
                     "start": chunk[0]["start"],
                     "end": chunk[-1]["end"],
-                    "text": "".join(item["text"] for item in chunk),
+                    "text": join_parts([item["text"] for item in chunk]),
                     "lines": chunk,
                 }
             )
@@ -905,6 +936,58 @@ def aggregate(out_root: Path, top: int) -> dict:
     return stats
 
 
+TRANSCRIPT_SUFFIXES = (".transcript.json", ".transcript.srt", ".transcript.vtt",
+                       ".json", ".srt", ".vtt")
+
+
+def transcript_stem(name: str) -> str:
+    """剥掉已知的字幕/文字稿后缀，得到不含格式名的茎。"""
+    for suffix in TRANSCRIPT_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def language_rank(stem: str) -> tuple[int, str]:
+    """同一支视频的多条字幕轨里，哪条最接近「原声」。
+
+    yt-dlp 一次 `--sub-langs "zh.*,en.*"` 会给同一支视频落下好几条轨：
+    `en`、`en-orig`，甚至自动翻译出来的 `en-en`（实测与 `en` 逐字节相同）。
+    全量喂进批处理，同一支视频会被处理三遍、全局精选里重复三次。
+
+    排序（越小越优先）：
+      0  没有语言码（Whisper 转写就是这种），或 `-orig` 原声轨
+      1  单一语言码：`en` / `zh`
+      2  带一个横线的变体：`zh-Hans` / `pt-BR`
+      3  两个以上横线：自动翻译轨 `zh-Hans-en` / `en-en`
+    """
+    head, dot, tail = stem.rpartition(".")
+    if not dot or not tail or not LANG_CODE.match(tail):
+        return (0, "")
+    if tail.endswith("orig"):
+        return (0, tail)
+    dashes = tail.count("-")
+    return (1 if dashes == 0 else 2 if dashes == 1 else 3, tail)
+
+
+def dedupe_by_video(paths: list[Path]) -> list[Path]:
+    """同一支视频只留一条最贴近原声的字幕。
+
+    分组键取「文件名去掉语言码」，所以 `标题_[id].en.srt` 与
+    `标题_[id].en-orig.srt` 会归到同一组，而两支不同视频不会互相吞掉。
+    """
+    best: dict[tuple[str, str], tuple[tuple[int, str], Path]] = {}
+    for path in paths:
+        stem = transcript_stem(path.name)
+        head, dot, tail = stem.rpartition(".")
+        base = head if (dot and head and LANG_CODE.match(tail)) else stem
+        key = (str(path.parent), base)
+        rank = language_rank(stem)
+        if key not in best or rank < best[key][0]:
+            best[key] = (rank, path)
+    return [item[1] for item in best.values()]
+
+
 def discover_transcripts(root: Path) -> list[Path]:
     """找待处理的文字稿。优先带时间戳的格式，纯 .json 放最后兜底。"""
     for pattern in ("*.transcript.json", "*.srt", "*.vtt", "*.json"):
@@ -912,33 +995,52 @@ def discover_transcripts(root: Path) -> list[Path]:
         # 排除视频附带的其它 json（如 yt-dlp 的 .info.json 是元数据不是文字稿）
         found = [item for item in found if not item.name.endswith(".info.json")]
         if found:
-            return found
+            return sorted(dedupe_by_video(found))
     return []
 
 
 VIDEO_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov", ".flv", ".m4v", ".avi", ".ts")
 
+# yt-dlp 的语言码：`en`、`zh-Hans`、`en-orig`、`pt-BR`
+LANG_CODE = re.compile(r"^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*$")
+
+
+def video_stem_candidates(stem: str) -> list[str]:
+    """由「剥掉字幕后缀的茎」推出可能对应的视频茎，长的优先。
+
+    只有两条规则：
+      1. 末段像语言码（`en` / `zh-Hans` / `en-orig`）就摘掉——这是 yt-dlp 的命名；
+      2. 退回到「第一个点之前」——这是老规则的兜底，保留是为了不破坏既有命名。
+
+    **不能只靠规则 2**：取视频标题当文件名之后，标题里的点会把 `split(".")[0]` 截断
+    （`20241105_A.I. and the future_xyz.en` → `20241105_A`），于是配不上视频。
+    规则 1 按语言码的形状判断，不受标题里有多少个点影响。
+    """
+    candidates: list[str] = []
+    if stem:
+        candidates.append(stem)
+    if "." in stem:
+        head, _, tail = stem.rpartition(".")
+        if head and LANG_CODE.match(tail):
+            candidates.append(head)
+        candidates.append(stem.split(".")[0])
+    ordered: list[str] = []
+    for item in candidates:
+        if item and item not in ordered:
+            ordered.append(item)
+    return ordered
+
 
 def sibling_video(transcript: Path) -> Path | None:
     """找与文字稿同名的视频。
 
-    两种命名都要认：
+    认两种命名：
       douyin-asr-pipeline：`X.mp4` 配 `X.mp4.transcript.json`
       yt-dlp：           `X.mp4` 配 `X.en.srt`（语言码夹在中间）
-    所以先剥掉已知标记，再拿「全名」和「第一个点之前的部分」两种候选去找视频。
     """
-    stem = transcript.name
-    for suffix in (".transcript.json", ".transcript.srt", ".transcript.vtt",
-                   ".json", ".srt", ".vtt"):
-        if stem.endswith(suffix):
-            stem = stem[: -len(suffix)]
-            break
+    stem = transcript_stem(transcript.name)
 
-    candidates = [stem]
-    if "." in stem:
-        candidates.append(stem.split(".")[0])
-
-    for base in candidates:
+    for base in video_stem_candidates(stem):
         for extension in VIDEO_SUFFIXES:
             candidate = transcript.parent / f"{base}{extension}"
             if candidate.is_file():

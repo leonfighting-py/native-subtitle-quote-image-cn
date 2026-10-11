@@ -147,10 +147,52 @@ python3 "<SKILL_DIR>/scripts/select_quotes.py" pick "source/<id>/<id>.en.srt" \
 python3 "<SKILL_DIR>/scripts/select_quotes.py" batch source/ --out work/ --top 5
 ```
 
-它按 `*.transcript.json` → `*.srt` → `*.vtt` 的顺序找文字稿，并自动跳过
+它按 `*.transcript.json` → `*.srt` → `*.vtt` → `*.json` 的顺序找文字稿，并自动跳过
 yt-dlp 的 `*.info.json`（那是元数据、没有 `segments`）。
 同名视频会被自动认出来当取帧源，包括 yt-dlp 的 `talk.en.srt` ↔ `talk.mp4` 这种命名。
+**同一支视频的多条语言轨只处理一条**（优先 `-orig` 原声轨）——
+否则一次 `--sub-langs "zh.*,en.*"` 就会让同一支视频在全局精选里重复三遍。
 排序依据与局限见 [auto-quote-selection.md](auto-quote-selection.md)。
+
+### 3.5.1 整个频道 / 播放列表：用 `fetch_transcripts.py`
+
+不要手写循环去套上面的命令。脚本已经把「先取字幕、后补视频」的两段式做进去了：
+
+```bash
+# 1. 只取字幕（不下载视频），几分钟拿下一个频道
+python3 "<SKILL_DIR>/scripts/fetch_transcripts.py" \
+  "https://www.youtube.com/@频道/videos" --out source/ --limit 50
+
+# 2. 选句，产出审阅表与全局精选
+python3 "<SKILL_DIR>/scripts/select_quotes.py" batch source/ --out work/ --top 5
+
+# 3. 人看过审阅表后，只给要出图的那几条补视频
+python3 "<SKILL_DIR>/scripts/fetch_transcripts.py" \
+  --ids "8S0FDjFBj8o,dQw4w9WgXcQ" --out source/ --videos
+
+# 4. 出图（视频已在手，批处理自动配对）
+python3 "<SKILL_DIR>/scripts/select_quotes.py" batch source/ --out work/ \
+  --render --render-mode script --aspect 3:4 --width 1080
+```
+
+**为什么必须先选后下**：挑句子只需要文字稿。一个 200 条的频道全量下载是几十 GB 和几小时；
+只取字幕是几分钟。反过来做，你会把绝大多数带宽花在永远用不上的素材上。
+
+几个参数的含义：
+
+| 参数 | 说明 |
+|---|---|
+| `--limit N` | 只处理前 N 条；枚举阶段也带 `--playlist-end`，不会为了拿 3 条而列完整个频道 |
+| `--ids A,B` | 只处理这些 id 或链接。**给了它就不再碰整个频道**，适合第 3 步补视频 |
+| `--videos` | 同时下载视频（`bv*[height<=1080]+ba`，1080p 足够做社交图） |
+| `--dry-run` | 只列出将要处理的条目，不下载 |
+| `--cookies-from-browser` / `--proxy` | 同上面的 Cookie 与代理规则 |
+
+重跑是增量的：内置了一份 `--download-archive`（`.fetched.txt`），已取过的条目直接跳过，
+所以可以定期对新更的频道重跑同一条命令。
+
+跑完会写一份 `sources.json`，逐个条目记下 id、标题、时长、拿到了哪些字幕、
+以及**哪些条目根本没有字幕轨**——最后一类必须改走本地 Whisper 转写，不要静默漏掉。
 
 ### 3.6 英文/非中文素材的两点注意
 

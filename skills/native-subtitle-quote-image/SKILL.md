@@ -47,6 +47,8 @@ python3 "<SKILL_DIR>/scripts/check_update.py" --json
 - **源视频是竖屏或方形**：先读 [references/portrait-and-vertical.md](references/portrait-and-vertical.md)。默认字幕带 `0.78–0.96` 是按横屏字幕位置设计的，套在竖屏素材上会圈不到字幕；直接用 `--aspect 3:4` 还会裁掉约 38% 的纵向画面。
 - **读长视频 → 选题 → 写文章/帖子 → 配图**：读 [references/end-to-end-workflow.md](references/end-to-end-workflow.md)。
 - **用户不想先看完视频，要求批量自动挑出值得传播的句子并出图**：读 [references/auto-quote-selection.md](references/auto-quote-selection.md)。核心是先用 `scripts/select_quotes.py` 做确定性清洗与排序，把上千句压到几十条候选，再让模型/人复核。**不要把整篇文字稿直接丢给模型让它自由发挥**——那既跑不动批量，也失去可回溯性。
+- **要给整个频道 / 播放列表批量取文字稿**：用 `scripts/fetch_transcripts.py`，读 [references/yt-dlp-and-transcripts.md](references/yt-dlp-and-transcripts.md)。顺序必须是**先只取字幕、选句、再下载被选中的视频**——反过来会把几十 GB 花在永远用不上的素材上。`--sub-format` 优先 `srt`，`--lang` 不要写通配符（会把自动翻译轨一起拉下来）。
+- **用户问「能不能自动从链接一路做到发布」**：读 [references/auto-quote-selection.md](references/auto-quote-selection.md) 末尾的链路说明。**本 skill 不含任何发布能力**，流水线止于 `images/`；不要承诺自动发到社交平台。
 - **台词条太高、间隔太宽、缺少美感**：读 [references/visual-style.md](references/visual-style.md)。
 - **本地短视频且时间点已确定**：直接执行下面的核心流程。
 

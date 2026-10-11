@@ -42,3 +42,4 @@ jobs:
           python skills/native-subtitle-quote-image/scripts/select_quotes.py --help
           python skills/native-subtitle-quote-image/scripts/select_quotes.py pick --help
           python skills/native-subtitle-quote-image/scripts/select_quotes.py batch --help
+          python skills/native-subtitle-quote-image/scripts/fetch_transcripts.py --help

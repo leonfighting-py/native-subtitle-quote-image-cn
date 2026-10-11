@@ -89,7 +89,7 @@ python3 skills/native-subtitle-quote-image/scripts/select_quotes.py batch \
 
 ```text
 覆盖视频     59 期（568 分钟）
-候选窗口     50,557
+候选窗口     50,560
 入选         291
 耗时         约 4 秒（不含出图）
 ```
@@ -97,7 +97,7 @@ python3 skills/native-subtitle-quote-image/scripts/select_quotes.py batch \
 设计上刻意**不让模型直接读整篇文字稿**——那是几十万字、批处理跑不动，也失去逐句回溯能力。
 脚本先用确定性规则清洗、切窗、打分、去重，把工作量压到 174:1，模型只在最后判断语义。
 
-实现过程中查清并处理的七个素材特性：
+实现过程中查清并处理的九个素材特性：
 
 | 发现 | 实测数据 | 处理方式 |
 |---|---|---|
@@ -108,9 +108,10 @@ python3 skills/native-subtitle-quote-image/scripts/select_quotes.py batch \
 | 序数词**冒充数字** | 「第一」「第二个」无处不在 | 信号词只认真正的数量；否则过半候选被误标、排序尽毁 |
 | YouTube 字幕是**滚动缓冲**格式 | 315 个 cue 里 113 个带 `<c>`/词级时间标签、一半是 10 毫秒翻转 cue | 剥行内标签 + 只取新增行 + 裁相邻重叠；改完 VTT 与 SRT 两条路径产出逐字相同 |
 | 字幕**不能按空行切块** | 滚动 cue 正文里夹着只含空白的行 | 改为逐行扫描；否则首句会被劈丢（实测 YouTube 第一条永远丢失） |
+| 一次 `--sub-langs "zh.*,en.*"` 会落下**同一支视频的多条轨** | 实测一个英文视频落了 `en` / `en-orig` / `en-en`，其中 `en-en` 与 `en` 逐字节相同 | 消费端按「文件名去掉语言码」分组，只留最贴近原声的那条；否则同一支视频在全局精选里重复三遍 |
+| 字幕是按句切开的，**拼回整段要还原词间空格** | 英语会粘连成 `yourconversations`，并一路带进候选标题与 `全局精选.md` 的原文 | 按书写系统逐对判断：相邻有中日韩字符就不加空格，否则加空格 |
 
-后五项都补了回归测试并做反向验证（9 条断言在改动前的代码上全部失败）。
-竖屏素材在脚本模式下的**字幕重影**问题也在文档中给出实测解法
+后七项都补了回归测试并做反向验证（13 条断言在改动前的代码上全部失败）。竖屏素材在脚本模式下的**字幕重影**问题也在文档中给出实测解法
 （`--frame-bottom 0.55 --band-center 0.5`）。
 
 时长校正还暴露了一个只在 CI 上才现形的问题：`probe_duration` 起初只写裸 `"ffmpeg"` 命令，
@@ -121,28 +122,41 @@ CI 上没有系统 ffmpeg，时长校正**静默失效**。现已与 `native_sub
 
 ### 5. 打通「链接 → 文字稿 → 选句 → 出图」的 URL 链路
 
-上游的 URL 入口止于「拿到文字时间轴」，选句仍要人工。现在两条缺口都补上了：
+上游的 URL 入口止于「拿到文字时间轴」，选句仍要人工。现在整条链路都补齐了，
+并且**按「先取字幕、再选句、最后才下视频」的三段式组织**：
 
 ```bash
-# 1. 只拿字幕，不下载视频（srt 优先，vtt 兜底）
-yt-dlp --no-playlist --skip-download \
-  --write-subs --write-auto-subs --sub-langs "en.*" --sub-format "srt/vtt" \
-  -o "source/%(id)s/%(id)s.%(ext)s" "URL"
+# 1. 整个频道/播放列表只取字幕（不下载视频，几分钟）
+python3 skills/native-subtitle-quote-image/scripts/fetch_transcripts.py \
+  "https://www.youtube.com/@频道/videos" --out source/ --limit 50
 
-# 2. 选句 + 出图，一条命令
-python3 skills/native-subtitle-quote-image/scripts/select_quotes.py pick \
-  source/<id>/<id>.en.srt --out work/<id> --top 5 \
-  --render --render-mode script --aspect 3:4 --width 1080
+# 2. 选句，产出审阅表与全局精选
+python3 skills/native-subtitle-quote-image/scripts/select_quotes.py \
+  batch source/ --out work/ --top 5
+
+# 3. 人看过审阅表后，只给要出图的那几条补视频
+python3 skills/native-subtitle-quote-image/scripts/fetch_transcripts.py \
+  --ids "8S0FDjFBj8o,dQw4w9WgXcQ" --out source/ --videos
+
+# 4. 出图（视频已在手，批处理自动配对）
+python3 skills/native-subtitle-quote-image/scripts/select_quotes.py \
+  batch source/ --out work/ --render --render-mode script --aspect 3:4 --width 1080
 ```
+
+为什么要分成三段：**挑句子只需要文字稿**。一个 200 条的频道全量下载是几十 GB 和几小时，
+只取字幕是几分钟。反过来做，绝大多数带宽会花在永远用不上的素材上。
+`fetch_transcripts.py` 内置增量清单（`.fetched.txt`），重跑只补新更的条目。
 
 实测（TED 演讲 `8S0FDjFBj8o`，355 秒）：146 行 → 426 个候选窗口 → 5 组 → 5 张图，
 `--sub-format srt` 和 `vtt` **两条路径的最终选句逐字相同**。
 
-顺带说明两件容易踩的事：
+顺带说明三件容易踩的事：
 
 - **`--sub-format` 优先 `srt`。**YouTube 的自动字幕原生只有 VTT，而 VTT 是滚动缓冲格式，
   每条 cue 都把上一行重抄一遍。srt 等于让 yt-dlp 先替你归一化。
-  两条都支持，但 srt 少一层转换、更好排查。
+- **`--lang` 不要写通配符。**`zh.*,en.*` 会把自动翻译轨（`zh-Hans-en`、`en-en`）一起拉下来，
+  一个中文频道能落下几十个同义文件。脚本默认用具体标签。
+  消费端也会兜底：同一支视频的多条语言轨只处理一条（优先 `-orig` 原声轨）。
 - **非中文素材的「发布价值」恒为 0。**信号词表是按中文写的，实测那份英文演讲
   426 个候选窗口的发布价值全是 0.0，实际只按结构三维排序。
   **英文素材排出来的是「结构完整的段落」，不是「值得传播的金句」**，
@@ -154,12 +168,13 @@ python3 skills/native-subtitle-quote-image/scripts/select_quotes.py pick \
 ### 6. 这条链路**不包含**发布
 
 从「拿到链接」到「产出图片」已经跑通，但**送到社交平台这一步在本仓库里完全不存在**——
-流水线止于 `images/` 目录。任何「自动发布」都需要另做：平台开放接口与授权、
-定时任务、以及各平台对自动化发布的服务条款约束。仓库不预置、也不假装支持。
+流水线止于 `images/` 目录。这是有意的设计边界：各平台开放接口都需要企业资质或应用审核，
+还牵扯定时任务与平台对自动化发布的服务条款约束。仓库存放「出图工具」这一个职责，
+不预置、也不假装支持发布。需要发布时另起一层，不要塞进这个 skill。
 
 ### 版本号
 
-`VERSION` 标为 `2.3.0-cn.3`。`check_update.py` 的更新检查仍指向上游仓库，
+`VERSION` 标为 `2.3.0-cn.4`。`check_update.py` 的更新检查仍指向上游仓库，
 这是有意保留的：用它来发现上游新版本，便于合并。
 
 ## 安装
@@ -203,9 +218,10 @@ python3 skills/native-subtitle-quote-image/scripts/check_environment.py --url-mo
 python3 -m unittest discover -s tests
 ```
 
-83 个用例，覆盖布局几何、字幕带识别、重复帧拦截、清洗去重、打分信号、时长校正与 FFmpeg 解析、
-SRT/VTT 解析（行内标签、滚动字幕、相邻重叠、cue 抬头）、文字稿发现与视频配对、
-两个字幕模式的端到端出图，以及九处修复的回归。
+118 个用例，覆盖布局几何、字幕带识别、重复帧拦截、清洗去重、打分信号、时长校正与 FFmpeg 解析、
+SRT/VTT 解析（行内标签、滚动字幕、相邻重叠、cue 抬头）、语言轨归并与视频配对、
+跨语言拼接的空格、频道批量取字幕（用假 yt-dlp 跑端到端）、
+两个字幕模式的端到端出图，以及十三处修复的回归。
 
 CI（[`.github/workflows/tests.yml`](.github/workflows/tests.yml)）在每次 push 与 PR 时
 于 Python 3.10 和 3.13 上跑全套测试，并检查 CLI 可用性。
@@ -218,13 +234,18 @@ CI（[`.github/workflows/tests.yml`](.github/workflows/tests.yml)）在每次 pu
 - 12 个平台里只有 **B站** 和 **抖音** 做过完整实测，其余（微博、小红书、AcFun、优酷、爱奇艺、西瓜、头条、喜马拉雅、虎牙、斗鱼）只确认了 extractor 存在。
 - YouTube 链路只在 **1 支视频**（TED `8S0FDjFBj8o`）上端到端验证过，包括自动字幕下载、VTT/SRT 解析与出图；
   多语言字幕轨（`zh-Hans-en` 一类自动翻译轨）的 429 行为未在本分支复测。
+- `fetch_transcripts.py` 的**真实站点**行为只在一个公开播放列表（限 2 条）上验过一次；
+  CI 里跑的是**假的 yt-dlp**（覆盖播放列表枚举、多语言轨落盘、`--playlist-end`、无字幕条目上报），
+  不联网。频道私密性、Cookie 授权、403/429 的实测仍以 [yt-dlp-and-transcripts.md](skills/native-subtitle-quote-image/references/yt-dlp-and-transcripts.md) 的手工流程为准。
+- 语言轨归并按**文件名形状**判断（末段是否像语言码），不是读字幕内容里的语言标签。
+  文件名被人工改过时可能归错组。
 - 竖屏文档里的字号、区间数值来自 1080×1920 合成素材的实测，真实平台素材的字幕位置差异较大，必须先跑 `band` 预览。
 - `select_quotes.py` 的打分是**形式特征**（信号词、词面重叠、句数、跨度），认得出「像金句」的结构，
   认不出反讽、上下文依赖和圈内梗。它把候选压到几十条，**不判断语义是否真的成立**——
   `审阅表.md` 末尾明确要求人工确认，交付时也不得把自动排序当作用户已确认。
 - **打分信号词只有中文**，非中文素材的「发布价值」恒为 0，实际只按结构三维排序。
 - 无视频时「画面可用性」标为 `unknown`，所以选出的时间点可能落在人物闭眼或转场帧上，必须 `sample` 回看。
-- 实测数据（59 期 / 50,557 个候选）来自单一语料：抖音知识类口播视频、`faster-whisper large-v3-turbo` 转写。
+- 实测数据（59 期 / 50,560 个候选）来自单一语料：抖音知识类口播视频、`faster-whisper large-v3-turbo` 转写。
   换语料（对话类、访谈类、有标点的转写）需要重新校准阈值。
 - 本仓库不含上游的示例图库（`examples/`）、多语言 README 和横幅生成脚本；
   仓库校验脚本 `scripts/validate_repo.py` 与横幅脚本 `scripts/render_banners.py` 因绑定上游的图库与资产结构，未纳入本分支。
