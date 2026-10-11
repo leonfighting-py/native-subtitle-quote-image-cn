@@ -42,12 +42,13 @@ python3 "<SKILL_DIR>/scripts/check_update.py" --json
 
 ## 按任务读参考文件
 
-- **YouTube 等境外 URL**：先读 [references/yt-dlp-and-transcripts.md](references/yt-dlp-and-transcripts.md)，获取用户有权处理的视频、元数据和辅助时间轴。URL 任务不能在一次公开请求失败后直接退回“只支持本地视频”：若 YouTube 返回机器人登录验证、年龄验证或用户自己的非公开视频限制，先说明原因并取得授权，再按参考文件用 `yt-dlp --cookies-from-browser chrome` 继续。字幕和视频分两条命令下载；视频报 HTTP 403 时按参考文件的格式回退表逐级降级，字幕报 429 时缩减语言并放慢请求，都不要无限重试。
+- **YouTube 等境外 URL**：先读 [references/yt-dlp-and-transcripts.md](references/yt-dlp-and-transcripts.md)，获取用户有权处理的视频、元数据和辅助时间轴。URL 任务不能在一次公开请求失败后直接退回“只支持本地视频”：若 YouTube 返回机器人登录验证、年龄验证或用户自己的非公开视频限制，先说明原因并取得授权，再按参考文件用 `yt-dlp --cookies-from-browser chrome` 继续。字幕和视频分两条命令下载；视频报 HTTP 403 时按参考文件的格式回退表逐级降级，字幕报 429 时**退避几十秒重试是有效的**（实测撞 429 后重试第一次就成功；`fetch_transcripts.py` 已内置 `--retry-delays`），但要缩减一次请求的语言数、不要无限重试。判断 429 要看输出里的 `HTTP Error 429`，**不能看退出码**——`--ignore-errors` 会让 429 以退出码 0 收场。
 - **B站、抖音等中国大陆平台**：先读 [references/cn-platforms.md](references/cn-platforms.md)。国内平台的风控和字幕形态与 YouTube 不同，不要套用上面那份文档的命令。两条必须先记住的结论：B站的 `danmaku` 是弹幕不是字幕轨；抖音当前在 yt-dlp 侧完全不可用，不要反复试 Cookie，改用本地视频模式。
 - **源视频是竖屏或方形**：先读 [references/portrait-and-vertical.md](references/portrait-and-vertical.md)。默认字幕带 `0.78–0.96` 是按横屏字幕位置设计的，套在竖屏素材上会圈不到字幕；直接用 `--aspect 3:4` 还会裁掉约 38% 的纵向画面。
 - **读长视频 → 选题 → 写文章/帖子 → 配图**：读 [references/end-to-end-workflow.md](references/end-to-end-workflow.md)。
 - **用户不想先看完视频，要求批量自动挑出值得传播的句子并出图**：读 [references/auto-quote-selection.md](references/auto-quote-selection.md)。核心是先用 `scripts/select_quotes.py` 做确定性清洗与排序，把上千句压到几十条候选，再让模型/人复核。**不要把整篇文字稿直接丢给模型让它自由发挥**——那既跑不动批量，也失去可回溯性。
 - **要给整个频道 / 播放列表批量取文字稿**：用 `scripts/fetch_transcripts.py`，读 [references/yt-dlp-and-transcripts.md](references/yt-dlp-and-transcripts.md)。顺序必须是**先只取字幕、选句、再下载被选中的视频**——反过来会把几十 GB 花在永远用不上的素材上。`--sub-format` 优先 `srt`，`--lang` 不要写通配符（会把自动翻译轨一起拉下来）。
+- **要中文版（或原文之外的另一种语言）**：给取字幕和选句都加 `--translate zh-Hans`。这用的是 **YouTube 自带译文轨**（免费、无需登录），不是本地机器翻译。原文轨照常保留，**两套输出并存**（英文发 TikTok、中文发国内，互不覆盖）。取字幕侧自带 429 退避重试；选句侧按时间取译文、**不按行号映射**（人工译本的时间戳与正文会错位）。细节见 [references/yt-dlp-and-transcripts.md](references/yt-dlp-and-transcripts.md) 的「用 YouTube 自带译文轨产出中文版」一节。
 - **用户问「能不能自动从链接一路做到发布」**：读 [references/auto-quote-selection.md](references/auto-quote-selection.md) 末尾的链路说明。**本 skill 不含任何发布能力**，流水线止于 `images/`；不要承诺自动发到社交平台。
 - **台词条太高、间隔太宽、缺少美感**：读 [references/visual-style.md](references/visual-style.md)。
 - **本地短视频且时间点已确定**：直接执行下面的核心流程。

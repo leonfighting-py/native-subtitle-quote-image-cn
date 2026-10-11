@@ -568,40 +568,300 @@ def choose_times(
 
 
 def make_title(window: dict, limit: int = 18) -> str:
-    """标题只做文件名和内部导航，不会被画进图片。"""
-    text = re.sub(r"[^\w\u4e00-\u9fff]", "", window["text"])
+    """标题只做文件名和内部导航，不会被画进图片。
+
+    剥标点，但**保留词间空格**：英语若连空格一起剥掉，会粘成
+    `brokenaboneSolookslike`，在审阅表标题和 `scripts_zh/` 的文件名里都不可读
+    （英文标题同时是原文与译文两套产物的名字）。对纯中文没有影响。
+    """
+    text = re.sub(r"[^\w\u4e00-\u9fff\s]", "", window["text"])
+    text = re.sub(r"\s+", " ", text).strip()
     return text[:limit] or "未命名"
 
 
-def build_outputs(windows: list[dict], top: int) -> dict:
+def parse_targets(value: str | None) -> list[str]:
+    """`--translate zh-Hans,zh-Hant` → `['zh-Hans', 'zh-Hant']`；空值 = 不启用。"""
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+# 渲染器实测的单行容量（width 1080 与 1440 结果相同——字号 `out_width/18` 和
+# 可用宽度 `out_width*0.92` 都随宽度等比缩放，所以**容量与 width 无关**）：
+#
+#   基础字号（1440 时为 80px）   约 16 个汉字 / 约 32 个拉丁字符
+#   缩到可读下限（55%，44px）    29 个汉字 / 60 个拉丁字符
+#
+# 两组数一致地指向「1 个汉字 ≈ 2 个拉丁字符宽」。所以下面统一用**宽度单位**
+# 记账：汉字 2 单位、拉丁 1 单位。
+#
+# 44 单位 ≈ 22 汉字 ≈ 44 拉丁字符：字号约降到 75%，仍然醒目，
+# 又不会把行数顶破 MAX_TIMES_PER_IMAGE。
+ROW_UNITS = 44
+# 装不下就逐档放宽（字号随之变小）；56 单位已经接近 60 的硬上限，
+# 再宽就会撞上「缩小到可读下限后仍放不下」而整张图渲染失败。
+ROW_UNITS_MAX = 56
+
+SENTENCE_BREAK = re.compile(r"(?<=[，。！？；：、,.!?;:])")
+LEADING_PUNCT = re.compile(r"^[，。！？；：、,.!?;:]+")
+
+# 东亚宽字符 / 全角字符（含 U+3002「。」这类 CJK 标点、U+FF0C 全角逗号）。
+# 不能直接复用上面的 CJK——那个不含 U+3000–U+303F 的 CJK 标点段，会把
+# 句末的「。」当半个宽字符算，行就排超了。
+WIDE = re.compile(
+    r"[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff"
+    r"\ufe30-\ufe6b\uff00-\uff60\uffe0-\uffe6]"
+)
+
+
+def display_units(text: str) -> int:
+    """把一行文本换算成「宽度单位」：汉字 2 单位、拉丁字符 1 单位。
+
+    只按字符个数算是不够的：`全球8%的温室气体排放` 是 11 个字符，但宽度是 18 单位，
+    差了一倍——真实的排版限制看的是宽度。
+    """
+    return sum(2 if WIDE.match(char) else 1 for char in text)
+
+
+def unit_prefix_len(text: str, max_units: int) -> int:
+    """宽度不超过 max_units 的最长前缀有**几个字符**。
+
+    汉字是 2 单位，所以 44 单位的预算在纯汉字下是 22 个字符、纯拉丁下是 44 个字符。
+    按字符数硬切会把汉字行切出两倍长。
+    """
+    used = 0
+    for index, char in enumerate(text):
+        used += 2 if WIDE.match(char) else 1
+        if used > max_units:
+            return max(index, 1)
+    return len(text)
+
+
+def split_point(text: str, max_units: int) -> int:
+    """决定从第几个字符处切开：有空格的语言**优先落在词边界**上。
+
+    纯按宽度硬切会切出 `entire cli` / `mate fight,` 这种半截单词——英文看着像坏掉了。
+    中文没有空格，`rfind` 找不到，自然回落到按宽度切。
+    """
+    cut = unit_prefix_len(text, max_units)
+    if cut >= len(text):
+        return cut
+    space = text.rfind(" ", 0, cut)
+    return space if space > 0 else cut
+
+
+def split_text_rows(text: str, max_units: int) -> list[str]:
+    """按标点优先把一段文本切成每行不超过 max_units 宽度的若干行。
+
+    中文没有空格，单个词组就超长时只能硬切——但硬切**不能把标点甩到下一行开头**
+    （实测会切出 `…排放` / `。所以航运…` 这种，读起来像坏掉了）。
+    所以硬切之后把开头的标点要回来贴到上一行末尾，代价是那一行可能略超上限。
+    """
+    if display_units(text) <= max_units:
+        return [text.strip()]
+    rows: list[str] = []
+    current = ""
+    for piece in SENTENCE_BREAK.split(text):
+        if not piece:
+            continue
+        if current and display_units(current) + display_units(piece) > max_units:
+            rows.append(current)
+            current = piece
+        else:
+            current += piece
+        while display_units(current) > max_units:
+            cut = split_point(current, max_units)
+            head, tail = current[:cut], current[cut:]
+            keep = LEADING_PUNCT.match(tail)
+            if keep:
+                head, tail = head + keep.group(), tail[keep.end():]
+            rows.append(head)
+            current = tail
+    if current:
+        rows.append(current)
+    # 断点常常正好落在空格上（英文按逗号断句时是常态），行首/行尾的空格要剥掉，
+    # 否则渲染出来的行会莫名缩进一格。
+    cleaned = [row.strip() for row in rows if row.strip()]
+    return cleaned or [text]
+
+
+def _rows_for(cues_and_text: list[tuple[dict, str]], max_units: int) -> list[dict]:
+    """每条 cue 按 max_units 拆行，行的时间取该 cue 时间段的等分中点。
+
+    一条 cue 只拆出一行时，时间正好是该 cue 的中点——和「一个 cue 一行」的老行为一致。
+    """
+    rows: list[dict] = []
+    for cue, text in cues_and_text:
+        pieces = split_text_rows(text, max_units)
+        step = (cue["end"] - cue["start"]) / len(pieces)
+        for index, piece in enumerate(pieces):
+            rows.append({
+                "t": round(cue["start"] + step * (index + 0.5), 2),
+                "text": piece,
+            })
+    return rows
+
+
+def enforce_increasing(rows: list[dict]) -> list[dict]:
+    """把时间戳强行改成严格递增：渲染器会拒绝落在同一帧的两行。"""
+    last = -1.0
+    for row in rows:
+        if row["t"] <= last:
+            row["t"] = round(last + 0.1, 2)
+        last = row["t"]
+    return rows
+
+
+def original_rows(window: dict, max_rows: int = MAX_TIMES_PER_IMAGE) -> list[dict]:
+    """把窗口里的原文 cue 变成能画进字幕条的行。
+
+    以前这里是「一个 cue 一行」，并在注释里断言「拉丁字符约 50 个，所以英文原声行天然
+    放得下」。**实测这个前提不成立**：TED 自动字幕合并滚动 cue 之后，字幕句的中位数是
+    44 个拉丁字符、p90 是 67、最长 78，而渲染器缩到可读下限也只放得下 60 个——
+    40.3% 的 cue 超过 50 字符，21.6% 直接超过 60 必然报错
+    （`台词过长，缩小到可读下限后仍放不下`），整张图渲染不出来。
+
+    之前那个「英文放得下」的结论是在 **VTT 的滚动短行**上量的，不是合并后的整句；
+    而流水线用的恰恰是合并后的整句。所以英文这一套也得拆行。
+    """
+    kept = [(line, line["text"]) for line in window["lines"]]
+    kept = [
+        (line, text) for line, text in kept
+        if round((line["start"] + line["end"]) / 2, 2) > 0
+    ][:MAX_TIMES_PER_IMAGE]
+    rows = [
+        {"t": round((line["start"] + line["end"]) / 2, 2), "text": text}
+        for line, text in kept
+    ]
+    # 快路径：本来就放得下，一个 cue 一行，行为与改动前逐字节一致。
+    if all(display_units(row["text"]) <= ROW_UNITS_MAX for row in rows):
+        return rows
+    rows = _rows_for(kept, ROW_UNITS)
+    for max_units in range(ROW_UNITS + 4, ROW_UNITS_MAX + 1, 4):
+        if len(rows) <= max_rows:
+            break
+        rows = _rows_for(kept, max_units)
+    return enforce_increasing(rows)
+
+
+def translated_rows(
+    window: dict, translation: list[dict], max_rows: int = MAX_TIMES_PER_IMAGE
+) -> list[dict]:
+    """把译文挂到窗口上：取落在窗口时间范围内的译文 cue，拆成可直接画的行。
+
+    刻意**不按「原文的行数」去切译文**。实测 YouTube 自动翻译轨与原声轨是逐条对齐的
+    （134/134 条、起止时间完全一致），但它的**换行位置与原文不总相同**——
+    出现过整行只有一个逗号（`['它是整个气候斗争中最大的隐藏杠杆之一', '，']`）的情况。
+    照着原文的行数切会画出残句。
+
+    也不能「一条 cue 一行」：中文一条 cue 往往是一整句（实测 15–29 字），
+    而渲染器缩到可读下限也只放得下 29 个汉字，29 字那行会直接报
+    「台词过长，缩小到可读下限后仍放不下」。所以按 ROW_UNITS 拆，装不下再放宽。
+
+    译文轨里可能有「有时间戳、正文为空」的 cue（实测自动翻译轨 134 条里有 2 条，
+    人工译文轨 358 条里有 26 条），直接跳过。
+    """
+    kept: list[tuple[dict, str]] = []
+    for cue in translation:
+        if cue["end"] <= window["start"] or cue["start"] >= window["end"]:
+            continue
+        text = join_parts(cue["text"].splitlines())
+        if text:
+            kept.append((cue, text))
+    if not kept:
+        return []
+
+    rows = _rows_for(kept, ROW_UNITS)
+    for max_units in range(ROW_UNITS + 4, ROW_UNITS_MAX + 1, 4):
+        if len(rows) <= max_rows:
+            break
+        rows = _rows_for(kept, max_units)
+    return enforce_increasing(rows)
+
+
+def fit_window(window: dict) -> dict:
+    """把窗口裁到渲染器接受的长度：拆行后不超过 MAX_TIMES_PER_IMAGE 行。
+
+    `render-script` **硬性**只收 7 个时间点，多了直接报
+    「台词脚本最多支持 7 个时间点；请拆成多张图」。而长句一旦拆行，
+    4–6 条的窗口就可能涨到 8–12 行；宽到 ROW_UNITS_MAX 也压不下去时，
+    只能**从尾部整条整条地退 cue**——退的是整句，不是半句话。
+
+    必须在这里裁、而不是在某一种语言里裁：英文和中文是同一个窗口的两套输出，
+    各裁各的会让两版图的内容对不上。
+
+    两条 cue 最坏也只拆成 4 行，所以循环一定能收敛到 ≥ MIN_LINES 条，不会把窗口退空。
+    """
+    if len(original_rows(window)) <= MAX_TIMES_PER_IMAGE:
+        return window
+    lines = list(window["lines"])
+    while len(lines) > MIN_LINES:
+        candidate = {**window, "lines": lines}
+        if len(original_rows(candidate)) <= MAX_TIMES_PER_IMAGE:
+            break
+        lines = lines[:-1]
+    trimmed = {
+        **window,
+        "lines": lines,
+        "start": lines[0]["start"],
+        "end": lines[-1]["end"],
+        "text": join_parts([line["text"] for line in lines]),
+        "dropped_lines": len(window["lines"]) - len(lines),
+    }
+    return trimmed
+
+
+def build_outputs(windows: list[dict], top: int, translation: list[dict] | None = None) -> dict:
     """产出两套可直接渲染的文件。
 
     原生模式：render 的 --manifest 本身就接受多张图，所以汇总成一个 JSON。
     脚本模式：render-script 一次只画一张（--script 是单个 {"lines":[...]}），
     所以必须拆成一张一个文件，绝不能塞成数组——实测踩过，会直接报
     「台词脚本必须包含至少 2 项的 lines 数组」。
+
+    给了译文轨就额外产出 `script_lines_zh`：**原文一套、译文一套，互不覆盖**，
+    因为一张图只能画一种语言，而两种语言都要发（英文发 TikTok）。
     """
-    chosen = pick_windows(windows, top)
-    images, scripts = [], []
+    chosen = [fit_window(window) for window in pick_windows(windows, top)]
+    images, scripts, scripts_zh = [], [], []
+    skipped_zh: list[dict] = []
+    trimmed: list[dict] = []
     for index, window in enumerate(chosen, 1):
+        if window.get("dropped_lines"):
+            trimmed.append({"order": index, "dropped_lines": window["dropped_lines"]})
         times = choose_times(window["lines"])
         title = make_title(window)
         images.append({"title": title, "times": times})
-        lines = [
-            {"t": round((line["start"] + line["end"]) / 2, 2), "text": line["text"]}
-            for line in window["lines"]
-        ]
-        lines = [item for item in lines if item["t"] > 0][:MAX_TIMES_PER_IMAGE]
+        lines = original_rows(window)
         if len(lines) >= MIN_LINES:
             scripts.append(
                 {"order": index, "title": title, "start": window["start"], "lines": lines}
             )
-    return {"native_manifest": {"images": images}, "script_lines": scripts, "chosen": chosen}
+        if translation is not None:
+            zh_lines = translated_rows(window, translation)
+            if MIN_LINES <= len(zh_lines) <= MAX_TIMES_PER_IMAGE:
+                scripts_zh.append(
+                    {"order": index, "title": title, "start": window["start"], "lines": zh_lines}
+                )
+            else:
+                skipped_zh.append({"order": index, "title": title, "rows": len(zh_lines)})
+    bundle = {"native_manifest": {"images": images}, "script_lines": scripts, "chosen": chosen}
+    if trimmed:
+        # 长句拆行之后超过渲染器的 7 行上限，从尾部退掉了若干条 cue
+        bundle["trimmed"] = trimmed
+    if translation is not None:
+        bundle["script_lines_zh"] = scripts_zh
+        bundle["translation_skipped"] = skipped_zh
+    return bundle
 
 
-def render_commands(scripts: list[dict], video: str | None) -> str:
+def render_commands(
+    scripts: list[dict], video: str | None, script_dir: str = "scripts", images_dir: str = "images"
+) -> str:
     """生成可直接执行的渲染命令，省掉手工拼 60 条命令。"""
     target = video or "请填入源视频路径.mp4"
+    # 原文那一套保持老路径不变（`X.mp4.quotes`），译文那一套才加子目录。
+    default_out = f"{target}.quotes" if images_dir == "images" else f"{target}.quotes/{images_dir}"
     out = [
         "#!/usr/bin/env bash",
         "# 由 select_quotes.py 生成：逐张渲染脚本字幕。",
@@ -610,7 +870,7 @@ def render_commands(scripts: list[dict], video: str | None) -> str:
         "",
         f'PYTHON="${{PYTHON:-python3}}"',
         f'VIDEO="${{VIDEO:-{target}}}"',
-        f'OUT="${{OUT:-{target}.quotes}}"',
+        f'OUT="${{OUT:-{default_out}}}"',
         'SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
         'mkdir -p "$OUT"',
         "",
@@ -619,7 +879,7 @@ def render_commands(scripts: list[dict], video: str | None) -> str:
         safe = re.sub(r"[^\w\u4e00-\u9fff]", "_", item["title"])
         out.append(
             f'"$PYTHON" "$SKILL_DIR/scripts/native_subtitle_stitch.py" render-script "$VIDEO" \\\n'
-            f'  --script "scripts/{item["order"]:02d}_{safe}.json" \\\n'
+            f'  --script "{script_dir}/{item["order"]:02d}_{safe}.json" \\\n'
             f'  --out "$OUT/{item["order"]:02d}_{safe}.jpg" \\\n'
             f'  --aspect 3:4 --width 1440'
         )
@@ -637,6 +897,8 @@ def render_review(
     windows: list[dict], chosen: list[dict], top: int,
     duration_source: str = "transcript", declared: float | None = None,
     drift: float | None = None,
+    translation: list[dict] | None = None,
+    translation_source: str | None = None,
 ) -> str:
     out = [f"# 候选审阅表：{source}", ""]
     out.append(f"- 总时长：{duration:.2f}s" if duration else "- 总时长：未知")
@@ -654,6 +916,8 @@ def render_review(
     else:
         out.append("- 时长来源：转写自带（没找到同名视频，时间点未经真实时长校正）")
     out.append(f"- 转写模型：{meta.get('model') or '未知'}")
+    if translation_source:
+        out.append(f"- 译文轨：{Path(translation_source).name}（逐行译文本表下方一并列出，请核对）")
     out.append(f"- 清洗丢弃：{len(dropped)} 段")
     out.append(f"- 候选窗口：{len(windows)} 个，选出 {len(chosen)} 个")
     out.append("")
@@ -697,6 +961,19 @@ def render_review(
         for line in window["lines"]:
             out.append(f"  - `{(line['start'] + line['end']) / 2:7.1f}s`　{line['text']}")
         out.append("")
+        if translation is not None:
+            zh_rows = translated_rows(window, translation)
+            out.append("- 译文（每行画一条；长句按标点拆开，因为基础字号一行只放得下 16 个汉字）：")
+            out.append("")
+            for row in zh_rows:
+                out.append(f"  - `{row['t']:7.1f}s`　{row['text']}")
+            if not MIN_LINES <= len(zh_rows) <= MAX_TIMES_PER_IMAGE:
+                out.append(
+                    f"  - ⚠ 译文 {len(zh_rows)} 行，超出渲染器接受的 "
+                    f"{MIN_LINES}–{MAX_TIMES_PER_IMAGE} 行，**这一组不会产出中文图**；"
+                    "可缩短窗口或手工拆句。"
+                )
+            out.append("")
     if len(chosen) < top:
         out.append(
             f"> 只选出 {len(chosen)} 组（目标 {top} 组）：候选之间重叠过高或总量不足，"
@@ -708,8 +985,15 @@ def render_review(
     out.append("1. 逐条确认或删除上面的候选，改写标题。")
     out.append("2. 原生字幕模式：`render VIDEO --manifest native_manifest.json --out-dir OUT`。")
     out.append("3. 脚本字幕模式：`render-script VIDEO --script script_lines.json --out OUT`。")
-    out.append("4. **不要跳过人工确认**：本表只按形式特征排序，没有判断语义是否真的成立；")
-    out.append("   转写本身也有错字（实测如「约数条件」应为「约束条件」），脚本模式必须先校对。")
+    if translation_source:
+        out.append("4. 中文那一套在 `scripts_zh/`，出图到 `images_zh/`：")
+        out.append("   `渲染脚本字幕_zh.sh`；图与英文版**同帧同时刻**，可直接对照。")
+        out.append("   ⚠ 译文来自机器翻译，**发布前必须逐句核对**，尤其人名、数字、专有名词。")
+        out.append("5. **不要跳过人工确认**：本表只按形式特征排序，没有判断语义是否真的成立；")
+        out.append("   转写本身也有错字（实测如「约数条件」应为「约束条件」），脚本模式必须先校对。")
+    else:
+        out.append("4. **不要跳过人工确认**：本表只按形式特征排序，没有判断语义是否真的成立；")
+        out.append("   转写本身也有错字（实测如「约数条件」应为「约束条件」），脚本模式必须先校对。")
     out.append("")
     return "\n".join(out)
 
@@ -796,7 +1080,15 @@ def process_one(
         raise SystemExit(f"只造出 {len(lines)} 行，凑不满一个窗口")
     for window in windows:
         window["score"] = score_window(window)
-    bundle = build_outputs(windows, top)
+
+    # 译文轨是可选的：没有就照旧只出原文一套，不报错。
+    targets = parse_targets(getattr(options, "translate", None)) if options is not None else []
+    translation_path = find_translation(transcript_path, targets) if targets else None
+    translation = None
+    if translation_path is not None:
+        translation = load_transcript(translation_path)[0]
+
+    bundle = build_outputs(windows, top, translation)
     chosen = bundle["chosen"]
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -832,24 +1124,36 @@ def process_one(
     (out_dir / "native_manifest.json").write_text(
         json.dumps(bundle["native_manifest"], ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    (out_dir / "script_lines.json").write_text(
-        json.dumps(bundle["script_lines"], ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    # 脚本字幕模式：一张图一个文件，因为 render-script 一次只画一张
-    script_dir = out_dir / "scripts"
-    script_dir.mkdir(exist_ok=True)
-    for item in bundle["script_lines"]:
-        safe = re.sub(r"[^\w\u4e00-\u9fff]", "_", item["title"])
-        (script_dir / f"{item['order']:02d}_{safe}.json").write_text(
-            json.dumps({"lines": item["lines"]}, ensure_ascii=False, indent=2), encoding="utf-8"
+    # 原文与译文各写一套：一张图只能画一种语言，两套互不覆盖。
+    for suffix, items in (("", bundle["script_lines"]), ("_zh", bundle.get("script_lines_zh"))):
+        if items is None:
+            continue
+        (out_dir / f"script_lines{suffix}.json").write_text(
+            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    shell = out_dir / "渲染脚本字幕.sh"
-    shell.write_text(render_commands(bundle["script_lines"], str(video) if video else None), encoding="utf-8")
-    shell.chmod(0o755)
+        # 脚本字幕模式：一张图一个文件，因为 render-script 一次只画一张
+        script_dir = out_dir / ("scripts_zh" if suffix else "scripts")
+        script_dir.mkdir(exist_ok=True)
+        for item in items:
+            safe = re.sub(r"[^\w\u4e00-\u9fff]", "_", item["title"])
+            (script_dir / f"{item['order']:02d}_{safe}.json").write_text(
+                json.dumps({"lines": item["lines"]}, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        shell = out_dir / ("渲染脚本字幕_zh.sh" if suffix else "渲染脚本字幕.sh")
+        shell.write_text(
+            render_commands(
+                items, str(video) if video else None,
+                script_dir=script_dir.name,
+                images_dir="images_zh" if suffix else "images",
+            ),
+            encoding="utf-8",
+        )
+        shell.chmod(0o755)
     (out_dir / "审阅表.md").write_text(
         render_review(
             transcript_path.name, meta, duration, dropped, windows, chosen, top,
             duration_source, declared, drift,
+            translation=translation, translation_source=str(translation_path) if translation_path else None,
         ),
         encoding="utf-8",
     )
@@ -999,6 +1303,52 @@ def discover_transcripts(root: Path) -> list[Path]:
     return []
 
 
+def find_translation(original: Path, targets: list[str]) -> Path | None:
+    """在同一目录里找原文轨对应的译文轨。
+
+    yt-dlp 把 YouTube 的自动翻译轨命名成 `<目标语>-<源语>`，例如
+    `zh-Hans-en` = 简体中文、从英语翻译；人工上传的译文轨则是裸语言码（如 `zh-Hant`）。
+    两种都认，**优先源语与原文轨一致**的那条。
+
+    同一支视频可能同时存在多条候选（实测 `zh-Hans-ar` / `zh-Hans-en` / `zh-Hans-fr`
+    / `zh-Hans-ko` …，因为 YouTube 会按每种识别语言各生成一份），所以必须挑一条，
+    不能全喂进去。
+
+    注意：**不能用 glob 匹配文件名**——yt-dlp 的输出模板里带 `[id]`，
+    方括号是 glob 的元字符，直接 glob 会一条都匹配不到。
+    """
+    if not targets:
+        return None
+    stem = transcript_stem(original.name)
+    head, dot, tail = stem.rpartition(".")
+    if not (dot and head and LANG_CODE.match(tail)):
+        return None
+
+    best: tuple[int, Path] | None = None
+    for candidate in sorted(original.parent.iterdir()):
+        if not candidate.is_file() or candidate == original:
+            continue
+        if not candidate.name.endswith((".srt", ".vtt", ".json")):
+            continue
+        if candidate.name.endswith(".info.json"):
+            continue
+        cstem = transcript_stem(candidate.name)
+        chead, cdot, ctail = cstem.rpartition(".")
+        if not (cdot and chead == head and LANG_CODE.match(ctail)):
+            continue
+        for order, target in enumerate(targets):
+            if ctail == target:
+                score = order                      # 裸语言码：人工译文，最优先
+            elif ctail.startswith(f"{target}-"):
+                source = ctail[len(target) + 1:]
+                score = (10 if source == tail else 20) + order
+            else:
+                continue
+            if best is None or score < best[0]:
+                best = (score, candidate)
+    return best[1] if best else None
+
+
 VIDEO_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov", ".flv", ".m4v", ".avi", ".ts")
 
 # yt-dlp 的语言码：`en`、`zh-Hans`、`en-orig`、`pt-BR`
@@ -1075,16 +1425,20 @@ def renderer_flags(options, mode: str) -> list[str]:
 
 
 def render_selected(bundle: dict, video: Path, out_dir: Path, options) -> tuple[list[Path], list[str]]:
-    """调用渲染器把选中的候选真正画成图。失败不抛异常，收集起来一并报告。"""
+    """调用渲染器把选中的候选真正画成图。失败不抛异常，收集起来一并报告。
+
+    有译文轨时**两套一起出**：原文进 `images/`、译文进 `images_zh/`，
+    同一组分镜用同一批时间点，所以两种语言的图可以逐张对照。
+    """
     import subprocess
 
     renderer = Path(__file__).resolve().parent / "native_subtitle_stitch.py"
     produced: list[Path] = []
     failures: list[str] = []
-    images_dir = out_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
 
     if options.render_mode == "native":
+        images_dir = out_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable, str(renderer), "render", str(video),
             "--manifest", str(out_dir / "native_manifest.json"),
@@ -1100,22 +1454,30 @@ def render_selected(bundle: dict, video: Path, out_dir: Path, options) -> tuple[
             produced += sorted(images_dir.glob("*.jpg"))
         return produced, failures
 
-    for item in bundle["script_lines"]:
-        safe = re.sub(r"[^\w\u4e00-\u9fff]", "_", item["title"])
-        target = images_dir / f"{item['order']:02d}_{safe}.jpg"
-        command = [
-            sys.executable, str(renderer), "render-script", str(video),
-            "--script", str(out_dir / "scripts" / f"{item['order']:02d}_{safe}.json"),
-            "--out", str(target),
-            *renderer_flags(options, "script"),
-        ]
-        if options.overwrite:
-            command.append("--overwrite")
-        result = subprocess.run(command, capture_output=True, text=True)
-        if target.is_file():
-            produced.append(target)
-        else:
-            failures.append(f"{target.name}: {(result.stdout + result.stderr).strip()[:200]}")
+    # 原生模式保留画面里已有的字幕，没有「换成中文」这回事，所以只有脚本模式出两套。
+    sets = [(bundle.get("script_lines") or [], "scripts", "images")]
+    if bundle.get("script_lines_zh") is not None:
+        sets.append((bundle["script_lines_zh"], "scripts_zh", "images_zh"))
+
+    for items, script_dirname, images_dirname in sets:
+        images_dir = out_dir / images_dirname
+        images_dir.mkdir(parents=True, exist_ok=True)
+        for item in items:
+            safe = re.sub(r"[^\w\u4e00-\u9fff]", "_", item["title"])
+            target = images_dir / f"{item['order']:02d}_{safe}.jpg"
+            command = [
+                sys.executable, str(renderer), "render-script", str(video),
+                "--script", str(out_dir / script_dirname / f"{item['order']:02d}_{safe}.json"),
+                "--out", str(target),
+                *renderer_flags(options, "script"),
+            ]
+            if options.overwrite:
+                command.append("--overwrite")
+            result = subprocess.run(command, capture_output=True, text=True)
+            if target.is_file():
+                produced.append(target)
+            else:
+                failures.append(f"{target.name}: {(result.stdout + result.stderr).strip()[:200]}")
     return produced, failures
 
 
@@ -1137,6 +1499,15 @@ def add_render_options(parser) -> None:
     parser.add_argument("--overwrite", action="store_true")
 
 
+def add_translate_option(parser) -> None:
+    """译文轨：给了就额外产出一套译文脚本与图，原文那一套照旧保留。"""
+    parser.add_argument(
+        "--translate",
+        help="要产出的译文语言，如 zh-Hans（可逗号分隔多个）。会在文字稿同目录里找 "
+             "yt-dlp 的 `<目标语>-<源语>` 译文轨（如 zh-Hans-en）。不给就只出原文一套。",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="从带时间戳文字稿里自动挑选值得传播的句子")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1146,6 +1517,7 @@ def main() -> None:
     one.add_argument("--video", type=Path)
     one.add_argument("--out", type=Path, required=True)
     one.add_argument("--top", type=int, default=3, help="最多产出几张图，默认 3")
+    add_translate_option(one)
     add_render_options(one)
 
     many = sub.add_parser("batch", help="批量处理一个目录下的全部文字稿")
@@ -1155,6 +1527,7 @@ def main() -> None:
     many.add_argument("--per-category", type=int, default=None,
                       help="每个顶层分类最多处理几个视频，默认全部")
     many.add_argument("--limit", type=int, default=None, help="全局最多处理几个视频")
+    add_translate_option(many)
     add_render_options(many)
 
     args = parser.parse_args()

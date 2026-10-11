@@ -5,17 +5,17 @@
 全量下载是几十 GB 和几小时；只取字幕是几分钟。
 正确顺序是**先选句、再下载被选中的那几条**：
 
-    # 1. 只取字幕（快）
-    fetch_transcripts.py "https://www.youtube.com/@频道/videos" --out source/
+    # 1. 只取字幕（快）；--translate 额外拉 YouTube 自带译文轨
+    fetch_transcripts.py "https://www.youtube.com/@频道/videos" --out source/ --translate zh-Hans
 
-    # 2. 选句，产出审阅表与全局精选
-    select_quotes.py batch source/ --out work/ --top 5
+    # 2. 选句，产出审阅表与全局精选（原文、译文两套都在同一份审阅表里）
+    select_quotes.py batch source/ --out work/ --top 5 --translate zh-Hans
 
     # 3. 人看过审阅表后，只给要出图的那几条补视频
     fetch_transcripts.py --ids "8S0FDjFBj8o,dQw4w9WgXcQ" --out source/ --videos
 
-    # 4. 出图（视频已在手，批处理会自动配对）
-    select_quotes.py batch source/ --out work/ --render --render-mode script
+    # 4. 出图（视频已在手，批处理会自动配对；原文一套、译文一套）
+    select_quotes.py batch source/ --out work/ --render --render-mode script --translate zh-Hans
 
 只依赖 `yt-dlp` 命令行，不 import 它的 Python 包——这样 yt-dlp 既可以是
 官方独立可执行文件，也可以是 pip 装的，和这个 skill 其它脚本的假设保持一致。
@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # 文件名里带上日期和标题便于人看，id 放最后保证唯一。
@@ -43,6 +44,18 @@ ARCHIVE_NAME = ".fetched.txt"
 # 实测一个英文频道也被拉下 `en` / `en-orig` / `en-en` 三份，其中 `en-en` 与 `en` 逐字节相同。
 # 这里只列「最可能是原声」的具体标签，按语言分组，用户可按频道语言调整。
 DEFAULT_LANGS = "zh-Hans,zh-Hant,zh-TW,zh,en-orig,en"
+
+# 译文轨撞 429 是**瞬时**的：同一个进程里主字幕下得好好的，紧接着的
+# `zh-Hans-en` 直接 429，换格式、加 --sleep-subtitles 都没用，
+# 但退避几十秒后重试**第一次就成功**。所以值得重试，而且是脚本内置行为，
+# 不要指望用户自己再跑一遍（--download-archive 保证重试不会重复下载）。
+DEFAULT_RETRY_DELAYS = "0,45,120,300"
+
+# 429 是实测到的；403 在视频下载时出现，同属 IP 限流，一起退避。
+RETRYABLE = re.compile(r"HTTP Error (?:429|403)|Too Many Requests", re.I)
+
+# 文件名尾部的语言标签：`...[id].zh-Hans-en.srt` → `zh-Hans-en`
+SUBTITLE_TAG = re.compile(r"\.([A-Za-z][A-Za-z0-9-]*)\.(?:srt|vtt)$", re.I)
 
 
 # ---------------------------------------------------------------- 前置检查
@@ -162,14 +175,64 @@ def enumerate_entries(
 # ---------------------------------------------------------------- 取字幕
 
 
-def subtitle_args(languages: str, sub_format: str) -> list[str]:
+def split_csv(value: str | None) -> list[str]:
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def translation_tracks(translate: str | None, sources: str | None) -> list[str]:
+    """把 `--translate zh-Hans` 展开成 yt-dlp 认得的译文轨标签。
+
+    YouTube 的译文轨**按源语各自生成一份**（`zh-Hans-en`、`zh-Hans-ko`、
+    `zh-Hans-fr`…），目标语只有一个、轨道却有一大把。所以要把每个
+    「可能的源语」都请求一遍——源语就是 `--lang` 里那些原声标签。
+    顺便请求裸的 `zh-Hans`：那是人工译本，有就直接用，没有也无妨。
+
+    注意 `--sub-langs` 用的是 **fullmatch**（见 yt-dlp 的
+    `orderedSet_from_options(..., use_regex=True)`），所以裸的 `zh-Hans`
+    **不会**顺带匹配 `zh-Hans-en`——想要译文轨就得把全名写出来。
+    """
+    tracks: list[str] = []
+    for target in split_csv(translate):
+        if target not in tracks:
+            tracks.append(target)
+        for source in split_csv(sources):
+            if source == target:
+                continue
+            track = f"{target}-{source}"
+            if track not in tracks:
+                tracks.append(track)
+    return tracks
+
+
+def subtitle_args(languages: str, sub_format: str, translate: str = "") -> list[str]:
+    langs = split_csv(languages)
+    for track in translation_tracks(translate, languages):
+        if track not in langs:
+            langs.append(track)
     return [
         "--skip-download",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", languages,
+        "--sub-langs", ",".join(langs),
         "--sub-format", sub_format,
     ]
+
+
+def translation_files(paths: list, translate: str | None) -> list:
+    """从已落地的字幕里挑出译文轨，供清单标注。
+
+    译文轨的标签一定等于目标语、或以 `目标语-` 开头（`zh-Hans-en`）。
+    """
+    targets = split_csv(translate)
+    if not targets:
+        return []
+    picked = []
+    for path in paths:
+        match = SUBTITLE_TAG.search(path.name)
+        tag = match.group(1) if match else ""
+        if any(tag == target or tag.startswith(f"{target}-") for target in targets):
+            picked.append(path)
+    return picked
 
 
 def video_args() -> list[str]:
@@ -224,7 +287,12 @@ def build_command(
         parts += ["--proxy", args.proxy]
     if not videos and isinstance(args.limit, int) and args.limit > 0:
         parts += ["--playlist-end", str(args.limit)]
-    parts += subtitle_args(args.lang, args.sub_format) if not videos else video_args()
+    if videos:
+        parts += video_args()
+    else:
+        parts += subtitle_args(
+            args.lang, args.sub_format, getattr(args, "translate", "") or ""
+        )
     parts.append(target)
     return parts
 
@@ -250,11 +318,59 @@ def targets_for(args, ids: list[str]) -> list[str]:
     return [args.url]
 
 
-def run(command: list[str]) -> int:
+def parse_delays(value: str | None) -> tuple[float, ...]:
+    """`"0,45,120"` → `(0.0, 45.0, 120.0)`。
+
+    第一项是「首次尝试前的等待」，所以默认的 `0,45,120,300` 表示
+    **最多试 4 次**。`--retry-delays ""` 或 `"0"` 就是只试一次、不重试。
+    """
+    delays: list[float] = []
+    for item in (value or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            delays.append(max(0.0, float(item)))
+        except ValueError:
+            raise SystemExit(f"--retry-delays 里这一项不是数字：{item}")
+    return tuple(delays) or (0.0,)
+
+
+def _indent(text: str) -> str:
+    return "\n".join(f"    {line}" for line in text.splitlines())
+
+
+def run(command: list[str], delays: tuple[float, ...] = (0.0,)) -> int:
+    """跑一次 yt-dlp；输出**捕获后原样转印**，这样能识别限流并退避重试。
+
+    直接 `subprocess.run(...)` 让子进程自己往终端写是不行的——那样就拿不到
+    「这次是 429」这个信息。所以这里改成捕获再打印，代价是进度条不再是
+    实时的（一次性吐出），可以接受。
+
+    **判断限流只能认输出文本，不能看退出码**：命令里带了 `--ignore-errors`，
+    而 yt-dlp 的 `trouble()` 在 ignoreerrors 下**跳过** `_download_retcode = 1`，
+    所以一个 429 会以「退出码 0 + stderr 里一行 ERROR」的形式静悄悄过去。
+    早先那版 `run()` 不看输出，等于把这些失败全吞了。
+
+    重试是安全的：命令里带 `--no-overwrites` 和 `--download-archive`，
+    已经下到的文件不会重下，重试只补缺的那些。
+    """
     printable = " ".join(command)
     print(f"  $ {printable[:160]}{'…' if len(printable) > 160 else ''}")
-    result = subprocess.run(command, text=True, encoding="utf-8", errors="replace")
-    return result.returncode
+    result = None
+    for attempt, delay in enumerate(delays):
+        if delay:
+            print(f"    撞限流，等 {delay:.0f}s 后重试（第 {attempt + 1} 次尝试）…")
+            time.sleep(delay)
+        result = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+        output = ((result.stdout or "") + (result.stderr or "")).strip()
+        if output:
+            print(_indent(output))
+        if not RETRYABLE.search(output):
+            return result.returncode
+    return result.returncode if result is not None else 1
 
 
 # ---------------------------------------------------------------- 主流程
@@ -285,6 +401,15 @@ def build_parser() -> argparse.ArgumentParser:
                              '一个中文频道能给你几十个同义文件')
     parser.add_argument("--sub-format", default="srt/vtt",
                         help='字幕格式，默认 "srt/vtt"（优先 srt）')
+    parser.add_argument("--translate", default="",
+                        help='顺带拉 YouTube 自带译文轨，如 "zh-Hans"（逗号分隔可给多个）。'
+                             '会按 `--lang` 里的每个原声标签展开成 `zh-Hans-en` 这类'
+                             '轨道——同一目标语在 YouTube 上按源语各有一份，'
+                             '所以要把可能的源语都请求一遍。**原声轨照常保留**，'
+                             '两套并存。译文轨经常撞 429，脚本会自动退避重试')
+    parser.add_argument("--retry-delays", default=DEFAULT_RETRY_DELAYS,
+                        help=f'撞限流后的退避秒数，默认 "{DEFAULT_RETRY_DELAYS}"'
+                             '（= 最多试 4 次）。给 "0" 就是不重试')
     parser.add_argument("--videos", action="store_true",
                         help="同时下载视频（默认只取字幕）")
     parser.add_argument("--cookies-from-browser", default=None,
@@ -338,35 +463,50 @@ def main() -> None:
         print("\n--dry-run：未下载任何内容。")
         return
 
+    delays = parse_delays(args.retry_delays)
     targets = targets_for(args, ids)
+    tracks = translation_tracks(getattr(args, "translate", ""), args.lang)
+    if tracks and not args.videos:
+        print(f"  译文轨: {', '.join(tracks)}")
     print(f"\n[2/2] 拉取{'字幕与视频' if args.videos else '字幕'}（{len(targets)} 次调用）…")
     for target in targets:
-        run(build_command(command, target, out_dir, args, videos=args.videos))
+        run(build_command(command, target, out_dir, args, videos=args.videos), delays)
 
+    # 选句时把 --translate 一起带上，否则第二套（中文）不会产出
+    hint = f" --translate {args.translate}" if args.translate and not args.videos else ""
     if args.videos:
         print("\n已同时拉取视频，可直接出图：")
-        print(f"  select_quotes.py batch {out_dir} --out work/ --render --render-mode script")
+        print(f"  select_quotes.py batch {out_dir} --out work/ --render"
+              f" --render-mode script{hint}")
     else:
         print("\n下一步（挑句子，不需要视频）：")
-        print(f"  select_quotes.py batch {out_dir} --out work/ --top 5")
+        print(f"  select_quotes.py batch {out_dir} --out work/ --top 5{hint}")
+
+    def with_files(entry: dict) -> dict:
+        subs = matching_subtitles(out_dir, entry["id"])
+        return {
+            **entry,
+            "subtitles": [str(p) for p in subs],
+            "translations": [str(p) for p in translation_files(subs, args.translate)],
+            "videos": [str(p) for p in matching_videos(out_dir, entry["id"])],
+        }
 
     manifest = {
         "source_url": args.url,
         "yt_dlp": yt_dlp_version(command),
         "languages": args.lang,
+        "translate": args.translate,
         "sub_format": args.sub_format,
         "videos_downloaded": bool(args.videos),
-        "entries": [
-            {
-                **entry,
-                "subtitles": [str(p) for p in matching_subtitles(out_dir, entry["id"])],
-                "videos": [str(p) for p in matching_videos(out_dir, entry["id"])],
-            }
-            for entry in selected
-        ],
+        "entries": [with_files(entry) for entry in selected],
     }
     missing = [item for item in manifest["entries"] if not item["subtitles"]]
     manifest["without_subtitles"] = [item["id"] for item in missing]
+    if args.translate:
+        # 有原声、没译文的条目单独报：它们照样能出英文图，只是没有中文版
+        bare = [item["id"] for item in manifest["entries"]
+                if item["subtitles"] and not item["translations"]]
+        manifest["without_translations"] = bare
     (out_dir / args.manifest).write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -378,6 +518,11 @@ def main() -> None:
         print("以下条目没有可用字幕（这些必须走本地 Whisper 转写）：")
         for item in missing:
             print(f"  - {item['id']}  {item['title'][:60]}")
+    if args.translate and manifest.get("without_translations"):
+        print(f"以下条目只有原声、没拿到译文轨（仍可出图，只是没有"
+              f"{args.translate} 版；可稍后单独重跑 --ids 补）：")
+        for video_id in manifest["without_translations"]:
+            print(f"  - {video_id}")
 
 
 def proxy_args(args) -> list[str]:

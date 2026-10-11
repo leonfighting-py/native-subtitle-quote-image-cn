@@ -6,7 +6,9 @@
     假脚本放在临时目录并前置到 PATH，所以不依赖网络、也不碰真实 YouTube。
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -28,6 +30,10 @@ FAKE_YTDLP = '''#!{python}
 
 真 yt-dlp 拿到播放列表链接会**一次把所有条目都下下来**，
 所以这里也要按播放列表逐条造文件，否则测不出「一个视频一条字幕」的行为。
+
+`--sub-langs` 里带 `-` 的标签（`zh-Hans-en`）各自落一个文件，用来验证
+「原声轨与译文轨并存」。`FAKE_429_ONCE=1` 时第一次下载调用会打印 429 并
+**以退出码 0 结束**——这正是 `--ignore-errors` 下的真实形态。
 """
 import json
 import os
@@ -35,6 +41,7 @@ import re
 import sys
 from pathlib import Path
 
+counter = Path({counter!r})
 argv = sys.argv[1:]
 
 if "--version" in argv:
@@ -61,21 +68,40 @@ else:
     found = re.search(r"[?&]v=([\\w-]+)", url) or re.search(r"youtu\\.be/([\\w-]+)", url)
     video_ids = [found.group(1) if found else "unknown"]
 
+# 每次「下载调用」都计数（--dump-json 那种枚举调用不算），
+# 这样测试才能分辨「重试了」和「没重试」。
+seen = int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(seen + 1))
+
+if os.environ.get("FAKE_429_ONCE") == "1" and seen == 0:
+    print("ERROR: unable to download video subtitles: HTTP Error 429: Too Many Requests",
+          file=sys.stderr)
+    sys.exit(0)
+
+# 哪些标签是「译文轨」由测试显式告知：译文轨是 `<目标语>-<源语>`，
+# 不能靠「有没有 `-`」判断——`zh-Hans`、`en-orig` 自己就带横杠。
+target = os.environ.get("FAKE_TRANSLATE", "")
+langs = ["en"]
+if target and "--sub-langs" in argv:
+    requested = argv[argv.index("--sub-langs") + 1].split(",")
+    langs += [item for item in requested if item.startswith(target + "-")]
+
 skip = set(filter(None, os.environ.get("FAKE_SKIP_IDS", "").split(",")))
 
 for video_id in video_ids:
     if video_id in skip:
         print("WARNING: no subtitles for", video_id)
         continue
-    name = (template
-            .replace("%(upload_date>%Y-%m-%d)s", "2024-01-01")
-            .replace("%(title).80s", "Fake Title")
-            .replace("%(id)s", video_id)
-            .replace("%(ext)s", "en.srt"))
-    target = Path(name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("1\\n00:00:00,000 --> 00:00:02,000\\nHello world\\n", encoding="utf-8")
-    print("fake-downloaded", target.name)
+    for lang in langs:
+        name = (template
+                .replace("%(upload_date>%Y-%m-%d)s", "2024-01-01")
+                .replace("%(title).80s", "Fake Title")
+                .replace("%(id)s", video_id)
+                .replace("%(ext)s", lang + ".srt"))
+        target = Path(name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("1\\n00:00:00,000 --> 00:00:02,000\\nHello world\\n", encoding="utf-8")
+        print("fake-downloaded", target.name)
 '''
 
 PLAYLIST = "\n".join(
@@ -90,24 +116,36 @@ PLAYLIST = "\n".join(
 class FakeYtDlp:
     """把假 yt-dlp 放进临时目录，前置到 PATH，用完清理。"""
 
-    def __init__(self, folder: Path, skip_ids: tuple[str, ...] = ()):
+    def __init__(self, folder: Path, skip_ids: tuple[str, ...] = (),
+                 rate_limit_once: bool = False, translate: str = ""):
         self.skip_ids = skip_ids
+        self.rate_limit_once = rate_limit_once
+        self.translate = translate
         self.bindir = folder / "bin"
         self.bindir.mkdir(parents=True, exist_ok=True)
         self.playlist = folder / "playlist.jsonl"
         self.playlist.write_text(PLAYLIST, encoding="utf-8")
+        self.counter = folder / "download-calls.txt"
         target = self.bindir / "yt-dlp"
         target.write_text(
-            FAKE_YTDLP.format(python=sys.executable, playlist=str(self.playlist)),
+            FAKE_YTDLP.format(python=sys.executable, playlist=str(self.playlist),
+                              counter=str(self.counter)),
             encoding="utf-8",
         )
         target.chmod(target.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    def download_calls(self) -> int:
+        return int(self.counter.read_text()) if self.counter.exists() else 0
 
     def env(self):
         env = dict(os.environ)
         env["PATH"] = f"{self.bindir}{os.pathsep}{env.get('PATH', '')}"
         if self.skip_ids:
             env["FAKE_SKIP_IDS"] = ",".join(self.skip_ids)
+        if self.rate_limit_once:
+            env["FAKE_429_ONCE"] = "1"
+        if self.translate:
+            env["FAKE_TRANSLATE"] = self.translate
         return env
 
 
@@ -164,13 +202,17 @@ class SelectEntriesTests(unittest.TestCase):
         self.assertEqual(picked[0]["id"], "zzzzzzzzzzz")
 
 
+def make_args(**overrides):
+    """按真实 parser 造一份参数，再按需覆盖——避免测试里手写默认值。"""
+    parser = MODULE.build_parser()
+    args = parser.parse_args(["URL", "--out", "/tmp/whatever"])
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
 class CommandBuildingTests(unittest.TestCase):
-    def make_args(self, **overrides):
-        parser = MODULE.build_parser()
-        args = parser.parse_args(["URL", "--out", "/tmp/whatever"])
-        for key, value in overrides.items():
-            setattr(args, key, value)
-        return args
+    make_args = staticmethod(make_args)
 
     def test_subtitle_mode_does_not_download_video(self):
         command = MODULE.build_command(["yt-dlp"], "URL", Path("/tmp/o"),
@@ -228,6 +270,189 @@ class FileMatchingTests(unittest.TestCase):
             (folder / "2024-01-01_Other_[bbbbbbbbbbb].en.srt").write_text("x", encoding="utf-8")
             self.assertEqual(MODULE.matching_subtitles(folder, "aaaaaaaaaaa"), [wanted])
             self.assertEqual(MODULE.matching_subtitles(folder, "ccccccccccc"), [])
+
+
+class TranslationTrackTests(unittest.TestCase):
+    """`--translate` 要展开成 YouTube 认得的译文轨标签。"""
+
+    def test_each_target_is_expanded_over_every_source(self):
+        """同一目标语在 YouTube 上按源语各有一份，所以每个源语都得请求一遍。"""
+        self.assertEqual(
+            MODULE.translation_tracks("zh-Hans", "en-orig,en"),
+            ["zh-Hans", "zh-Hans-en-orig", "zh-Hans-en"],
+        )
+
+    def test_bare_target_is_requested_for_a_manual_translation(self):
+        """裸标签是人工译本，存在就直接用；实测并非所有视频都有。"""
+        self.assertEqual(MODULE.translation_tracks("zh-Hans", "en")[0], "zh-Hans")
+
+    def test_no_flag_means_no_extra_tracks(self):
+        self.assertEqual(MODULE.translation_tracks("", "en,zh-Hant"), [])
+        self.assertEqual(MODULE.translation_tracks(None, "en"), [])
+
+    def test_several_targets_and_no_duplicates(self):
+        self.assertEqual(
+            MODULE.translation_tracks("zh-Hans,zh-Hant", "en"),
+            ["zh-Hans", "zh-Hans-en", "zh-Hant", "zh-Hant-en"],
+        )
+
+    def test_a_source_equal_to_the_target_is_skipped(self):
+        """`zh-Hans-zh-Hans` 不是真实的轨道名，别去请求它。"""
+        self.assertNotIn("zh-Hans-zh-Hans", MODULE.translation_tracks("zh-Hans", "zh-Hans,en"))
+
+    def test_subtitle_args_keep_the_original_languages(self):
+        """英文原轨必须原样保留——用户要把英文版发到 TikTok。"""
+        args = MODULE.subtitle_args("en-orig,en", "srt/vtt", "zh-Hans")
+        langs = args[args.index("--sub-langs") + 1].split(",")
+        for code in ("en-orig", "en", "zh-Hans-en"):
+            self.assertIn(code, langs)
+
+    def test_subtitle_args_without_translate_are_unchanged(self):
+        args = MODULE.subtitle_args("en-orig,en", "srt/vtt")
+        self.assertEqual(args[args.index("--sub-langs") + 1], "en-orig,en")
+
+    def test_a_dashed_language_in_the_passed_list_is_not_duplicated(self):
+        args = MODULE.subtitle_args("en,zh-Hans-en", "srt/vtt", "zh-Hans")
+        langs = args[args.index("--sub-langs") + 1].split(",")
+        self.assertEqual(langs.count("zh-Hans-en"), 1)
+
+    def test_video_mode_ignores_translate(self):
+        """视频那一趟不碰字幕，别把译文轨塞进去。"""
+        args = make_args(translate="zh-Hans")
+        command = MODULE.build_command(["yt-dlp"], "URL", Path("/tmp/o"), args, videos=True)
+        self.assertNotIn("--sub-langs", command)
+
+
+class TranslationFileTests(unittest.TestCase):
+    def test_picks_only_the_translation_tracks(self):
+        paths = [
+            Path("2024-01-01_X_[aaaaaaaaaaa].en.srt"),
+            Path("2024-01-01_X_[aaaaaaaaaaa].en-orig.srt"),
+            Path("2024-01-01_X_[aaaaaaaaaaa].zh-Hans-en.srt"),
+            Path("2024-01-01_X_[aaaaaaaaaaa].zh-Hans-en-orig.srt"),
+        ]
+        picked = [p.name for p in MODULE.translation_files(paths, "zh-Hans")]
+        self.assertEqual(picked,
+                         ["2024-01-01_X_[aaaaaaaaaaa].zh-Hans-en.srt",
+                          "2024-01-01_X_[aaaaaaaaaaa].zh-Hans-en-orig.srt"])
+
+    def test_the_bare_manual_track_counts_as_a_translation(self):
+        picked = MODULE.translation_files([Path("a.zh-Hans.srt")], "zh-Hans")
+        self.assertEqual(len(picked), 1)
+
+    def test_nothing_is_picked_without_a_target(self):
+        paths = [Path("a.zh-Hans-en.srt")]
+        self.assertEqual(MODULE.translation_files(paths, ""), [])
+
+    def test_a_chinese_original_is_not_mistaken_for_a_translation(self):
+        """`zh-Hant` 是原文轨时要留在原声那一侧，不能被算成 zh-Hans 的译文。"""
+        self.assertEqual(MODULE.translation_files([Path("a.zh-Hant.srt")], "zh-Hans"), [])
+
+
+class RetryDelayTests(unittest.TestCase):
+    def test_parses_a_comma_separated_list(self):
+        self.assertEqual(MODULE.parse_delays("0,45,120"), (0.0, 45.0, 120.0))
+
+    def test_empty_means_a_single_attempt(self):
+        self.assertEqual(MODULE.parse_delays(""), (0.0,))
+        self.assertEqual(MODULE.parse_delays(None), (0.0,))
+        self.assertEqual(MODULE.parse_delays("0"), (0.0,))
+
+    def test_junk_is_rejected_with_a_clear_message(self):
+        with self.assertRaises(SystemExit) as caught:
+            MODULE.parse_delays("0,soon")
+        self.assertIn("soon", str(caught.exception))
+
+    def test_negative_values_are_clamped(self):
+        self.assertEqual(MODULE.parse_delays("-5"), (0.0,))
+
+    def test_default_is_a_retry_ladder(self):
+        self.assertGreater(len(MODULE.parse_delays(MODULE.DEFAULT_RETRY_DELAYS)), 1)
+
+
+class RateLimitTests(unittest.TestCase):
+    """429 是瞬时限流，必须退避重试；其它错误不要浪费时间重试。"""
+
+    # 退避值取「非零但极小」：既能触发那句「撞限流」提示，又不会真的等下去。
+    NUDGE = (0.0, 0.01, 0.01)
+
+    def flaky(self, counter: Path, *, fail_times: int, message: str) -> list[str]:
+        """前 `fail_times` 次打印 `message` 并**以退出码 0 结束**，之后正常退出。
+
+        退出码 0 是有意的：`--ignore-errors` 下 yt-dlp 撞 429 就是这个形态。
+        """
+        code = (
+            "import pathlib, sys\n"
+            f"p = pathlib.Path({str(counter)!r})\n"
+            "n = int(p.read_text()) if p.exists() else 0\n"
+            "p.write_text(str(n + 1))\n"
+            f"if n < {fail_times}:\n"
+            f"    print({message!r})\n"
+            "    sys.exit(0)\n"
+            "print('all good')\n"
+        )
+        return [sys.executable, "-c", code]
+
+    def capture(self, command, delays):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = MODULE.run(command, delays)
+        return code, buffer.getvalue()
+
+    def test_429_is_retried_and_then_succeeds(self):
+        """实测：同一进程里主字幕正常、译文轨直接 429，退避后重试第一次就成功。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "n.txt"
+            command = self.flaky(counter, fail_times=1,
+                                 message="ERROR: HTTP Error 429: Too Many Requests")
+            code, output = self.capture(command, self.NUDGE)
+            self.assertEqual(code, 0)
+            self.assertEqual(counter.read_text(), "2")
+            self.assertIn("撞限流", output)
+            self.assertIn("all good", output)
+
+    def test_a_429_is_retried_even_when_the_exit_code_is_zero(self):
+        """`--ignore-errors` 下 429 是「退出码 0 + 一行 ERROR」，只能认文本。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "n.txt"
+            command = self.flaky(counter, fail_times=1,
+                                 message="ERROR: unable to download video subtitles: "
+                                         "HTTP Error 429: Too Many Requests")
+            code, _ = self.capture(command, self.NUDGE)
+            self.assertEqual(code, 0)
+            self.assertEqual(counter.read_text(), "2", "退出码 0 的 429 被当成成功了")
+
+    def test_a_hard_error_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "n.txt"
+            command = self.flaky(counter, fail_times=99,
+                                 message="ERROR: Video unavailable")
+            _, output = self.capture(command, self.NUDGE)
+            self.assertEqual(counter.read_text(), "1")
+            self.assertNotIn("撞限流", output)
+
+    def test_attempts_are_capped_by_the_delay_ladder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "n.txt"
+            command = self.flaky(counter, fail_times=99,
+                                 message="ERROR: HTTP Error 429: Too Many Requests")
+            self.capture(command, self.NUDGE)
+            self.assertEqual(counter.read_text(), "3")
+
+    def test_a_single_delay_means_no_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "n.txt"
+            command = self.flaky(counter, fail_times=99,
+                                 message="ERROR: HTTP Error 429: Too Many Requests")
+            self.capture(command, (0.0,))
+            self.assertEqual(counter.read_text(), "1")
+
+    def test_output_is_relayed_so_nothing_is_swallowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "n.txt"
+            command = self.flaky(counter, fail_times=0, message="unused")
+            _, output = self.capture(command, (0.0,))
+            self.assertIn("all good", output)
 
 
 class EndToEndTests(unittest.TestCase):
@@ -321,12 +546,110 @@ class EndToEndTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("--ids", result.stdout + result.stderr)
 
+    def test_translate_keeps_both_languages_and_records_them(self):
+        """英文原轨与中文译轨并存——英文版还要发 TikTok，不能被替换掉。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            out = folder / "source"
+            fake = FakeYtDlp(folder, translate="zh-Hans")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "https://www.youtube.com/playlist?list=X",
+                 "--out", str(out), "--limit", "2", "--lang", "en-orig,en",
+                 "--translate", "zh-Hans"],
+                capture_output=True, text=True, env=fake.env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            names = sorted(p.name for p in out.glob("*.srt"))
+            self.assertEqual(len(names), 6, names)  # 每视频 3 条：en + 两条 zh-Hans-*
+            self.assertTrue(any(n.endswith(".en.srt") for n in names), names)
+            self.assertTrue(any(n.endswith(".zh-Hans-en.srt") for n in names), names)
+
+            manifest = json.loads((out / "sources.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["translate"], "zh-Hans")
+            self.assertEqual(manifest["without_translations"], [])
+            for entry in manifest["entries"]:
+                self.assertEqual(len(entry["subtitles"]), 3, entry)
+                self.assertEqual(len(entry["translations"]), 2, entry)
+
+    def test_an_entry_without_a_translation_track_is_reported(self):
+        """有原声、没译文：还能出英文图，但要让人知道没中文版。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            out = folder / "source"
+            fake = FakeYtDlp(folder, translate="zh-Hant")  # 实际只请求 zh-Hans
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "https://www.youtube.com/playlist?list=X",
+                 "--out", str(out), "--limit", "1", "--lang", "en-orig,en",
+                 "--translate", "zh-Hans"],
+                capture_output=True, text=True, env=fake.env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads((out / "sources.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["without_translations"], ["aaaaaaaaaaa"])
+            self.assertIn("没拿到译文轨", result.stdout)
+
+    def test_translate_is_off_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            out = folder / "source"
+            fake = FakeYtDlp(folder)
+            subprocess.run(
+                [sys.executable, str(SCRIPT), "https://www.youtube.com/playlist?list=X",
+                 "--out", str(out), "--limit", "1"],
+                capture_output=True, text=True, env=fake.env(),
+            )
+            manifest = json.loads((out / "sources.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["translate"], "")
+            self.assertNotIn("without_translations", manifest)
+
+    def test_the_next_step_hint_carries_the_translate_flag(self):
+        """选句时漏了 --translate，第二套中文就不会产出——提示里必须带上。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            fake = FakeYtDlp(folder)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "https://www.youtube.com/playlist?list=X",
+                 "--out", str(folder / "source"), "--limit", "1", "--translate", "zh-Hans"],
+                capture_output=True, text=True, env=fake.env(),
+            )
+            self.assertIn("--translate zh-Hans", result.stdout)
+
+    def test_a_rate_limited_run_is_retried_by_the_cli(self):
+        """端到端验证退避重试真的接在了主流程上（这里把等待压成 0）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            out = folder / "source"
+            fake = FakeYtDlp(folder, rate_limit_once=True, translate="zh-Hans")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "https://www.youtube.com/playlist?list=X",
+                 "--out", str(out), "--limit", "2", "--lang", "en-orig,en",
+                 "--translate", "zh-Hans", "--retry-delays", "0,0.01"],
+                capture_output=True, text=True, env=fake.env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(fake.download_calls(), 2, "第一次 429 之后没有重试")
+            self.assertIn("撞限流", result.stdout)
+            self.assertEqual(len(list(out.glob("*.srt"))), 6)
+
+    def test_a_non_rate_limit_failure_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            fake = FakeYtDlp(folder, skip_ids=("aaaaaaaaaaa",))
+            subprocess.run(
+                [sys.executable, str(SCRIPT), "https://www.youtube.com/playlist?list=X",
+                 "--out", str(folder / "source"), "--limit", "1", "--retry-delays", "0,0,0"],
+                capture_output=True, text=True, env=fake.env(),
+            )
+            self.assertEqual(fake.download_calls(), 1, "没有字幕不是限流，不该重试")
+
     def test_help_works_without_any_dependency(self):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--videos", result.stdout)
+        self.assertIn("--translate", result.stdout)
+        self.assertIn("--retry-delays", result.stdout)
 
 
 if __name__ == "__main__":
