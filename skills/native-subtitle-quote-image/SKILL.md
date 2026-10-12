@@ -97,6 +97,7 @@ python3 -m pip install -r "<SKILL_DIR>/requirements.txt"
 - 原生字幕模式保留从画面顶部到 `--band-bottom` 的主图和完整字幕条；不重绘文字。
 - 脚本字幕模式可用 `--frame-top` / `--frame-bottom` 仅裁去不需要的源画面区域，默认保留全帧。先预览边界，不能裁掉人物关键部位；`--band-center` 相对裁切后的画面。
 - `natural` 不与 `--aspect` / `--hero-fraction` 合用；70% 主图验收只适用于脚本固定布局。两种布局都不得非等比拉伸。
+- 脚本固定布局默认开启主画面选帧：第一句那一帧里没人、或只是一张幻灯片／纯色卡片时，在 `--hero-search`（默认 1.5 秒）内就近换成有人的一帧，并在命令行打印实际选择；`--hero-search 0` 关闭。`--layout natural` 不接受 `--hero-search`。阈值与边界见 `references/visual-style.md` 的「主画面选帧」。
 
 ```bash
 python3 "<SKILL_DIR>/scripts/native_subtitle_stitch.py" render-script VIDEO \

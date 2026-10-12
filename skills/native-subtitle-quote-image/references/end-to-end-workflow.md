@@ -219,6 +219,11 @@ python3 "<SKILL_DIR>/scripts/native_subtitle_stitch.py" band VIDEO -t 61.2 \
 
 每张图默认使用 5 个严格递增的时间点：第一帧做主画面，其余四帧做字幕条。
 
+脚本固定布局渲染时，如果第一句那一帧里没人、或只是幻灯片 / 纯色卡片，`render-script` 会在
+`--hero-search`（默认 1.5 秒）内就近换成有人的一帧当主画面，并把实际选择打印出来；字幕条不受影响。
+看到 `主画面: 主画面改用 …s 的那一帧` 属正常，核对一下换到的位置是否合理即可。规则与边界见
+[visual-style.md](visual-style.md) 的「主画面选帧」。
+
 ### 原生字幕 manifest
 
 ```json

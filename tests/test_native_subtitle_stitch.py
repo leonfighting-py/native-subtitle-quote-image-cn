@@ -309,6 +309,22 @@ class NaturalGeometryTests(unittest.TestCase):
                 self.assertIn(message, proc.stderr)
                 self.assertNotIn("Traceback", proc.stderr)
 
+    def test_cli_rejects_invalid_hero_search_before_io(self):
+        for options, message in [
+            (["--hero-search", "-1"], "大于等于 0"),
+            (["--hero-search", "20"], "不能大于 10"),
+            (["--layout", "natural", "--hero-search", "1"], "不接受 --hero-search"),
+        ]:
+            with self.subTest(options=options):
+                proc = subprocess.run(
+                    [sys.executable, str(SCRIPT), "render-script", "unused.mp4",
+                     "--script", "unused.json", "--out", "unused.jpg", *options],
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(message, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+
     def test_cli_rejects_invalid_native_fit_options_before_io(self):
         for options, message in [
             (["--layout", "natural", "--fit", "crop"], "不接受 --fit"),
@@ -335,6 +351,47 @@ def subtitle_band(width, height, left, right, background="#5a5a5a"):
         draw.rectangle((x, height * 0.3, x + 3, height * 0.7), fill="white",
                        outline="black", width=1)
     return band
+
+
+SKIN = (200, 150, 120)
+
+
+def person_frame(size=(640, 360), coverage=0.09):
+    """黑底正中盖一块肤色椭圆，模拟「画面里有人」；居中以免被出图裁切切掉。"""
+    frame = Image.new("RGB", size, "black")
+    side = int(2 * (coverage * size[0] * size[1] / 3.14159265) ** 0.5)
+    left, top = (size[0] - side) // 2, (size[1] - side) // 2
+    ImageDraw.Draw(frame).ellipse((left, top, left + side, top + side), fill=SKIN)
+    return frame
+
+
+def slide_frame(size=(640, 360)):
+    """白底黑条，模拟纯色/近白的幻灯片。"""
+    frame = Image.new("RGB", size, "white")
+    draw = ImageDraw.Draw(frame)
+    for index in range(6):
+        y = round(size[1] / 6) + index * round(size[1] / 12)
+        draw.rectangle((round(size[0] * 0.12), y, round(size[0] * 0.88), y + 14),
+                       fill=(40, 40, 40))
+    return frame
+
+
+VARIED_COLORS = [
+    (20, 40, 220), (0, 120, 255), (10, 180, 200), (0, 90, 90),
+    (30, 30, 160), (0, 200, 120), (90, 0, 190), (150, 20, 200),
+    (20, 60, 100), (0, 150, 255), (60, 0, 120), (10, 110, 60),
+    (100, 100, 255), (0, 70, 180), (70, 20, 90), (25, 130, 190),
+]
+
+
+def varied_frame(size=(640, 360)):
+    """16 条冷色竖条：颜色够多、不是近白，模拟真实但无人的画面。"""
+    frame = Image.new("RGB", size, "black")
+    draw = ImageDraw.Draw(frame)
+    step = size[0] // len(VARIED_COLORS)
+    for index, color in enumerate(VARIED_COLORS):
+        draw.rectangle((index * step, 0, (index + 1) * step, size[1]), fill=color)
+    return frame
 
 
 class SideCropTests(unittest.TestCase):
@@ -458,6 +515,124 @@ class DuplicateFrameTests(unittest.TestCase):
             )
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
             self.assertTrue((tmp_path / "out" / "01_static.jpg").is_file())
+
+
+class HeroFrameTests(unittest.TestCase):
+    def test_candidate_offsets_are_symmetric_and_nearest_first(self):
+        self.assertEqual(
+            MODULE.hero_candidate_offsets(1.5), [0.0, -0.75, 0.75, -1.5, 1.5]
+        )
+        self.assertEqual(MODULE.hero_candidate_offsets(0), [0.0])
+
+    def test_person_and_slide_windows_are_separable(self):
+        self.assertGreater(
+            MODULE.skin_ratio(person_frame()), MODULE.HERO_SKIN_MIN
+        )
+        self.assertLess(MODULE.skin_ratio(slide_frame()), MODULE.HERO_SKIN_MIN)
+        self.assertLess(MODULE.skin_ratio(varied_frame()), MODULE.HERO_SKIN_MIN)
+
+    def test_only_plain_cards_count_as_flat(self):
+        self.assertTrue(MODULE.is_flat_card(slide_frame()))
+        self.assertFalse(MODULE.is_flat_card(varied_frame()))
+        self.assertFalse(MODULE.is_flat_card(person_frame()))
+
+    def test_hero_keeps_first_frame_when_it_already_has_a_person(self):
+        first = person_frame()
+        with mock.patch.object(MODULE, "grab_frame", return_value=person_frame()):
+            frame, note = MODULE.pick_hero_frame(
+                "unused", 4.13, 1.5, 0.0, 1.0, first
+            )
+        self.assertIs(frame, first)
+        self.assertIn("画面里有人", note)
+
+    def test_hero_moves_to_the_nearest_frame_with_a_person(self):
+        first = slide_frame()
+
+        def fake(video, when):
+            return person_frame() if round(when, 2) == 5.63 else slide_frame()
+
+        with mock.patch.object(MODULE, "grab_frame", side_effect=fake):
+            frame, note = MODULE.pick_hero_frame(
+                "unused", 4.13, 1.5, 0.0, 1.0, first
+            )
+        self.assertIsNot(frame, first)
+        self.assertGreater(MODULE.skin_ratio(frame), MODULE.HERO_SKIN_MIN)
+        self.assertIn("5.63s", note)
+        self.assertIn("向后找了 1.50s", note)
+
+    def test_hero_still_avoids_a_blank_card_when_nobody_is_in_frame(self):
+        first = slide_frame()
+        with mock.patch.object(MODULE, "grab_frame", return_value=varied_frame()):
+            frame, note = MODULE.pick_hero_frame(
+                "unused", 4.13, 1.5, 0.0, 1.0, first
+            )
+        self.assertFalse(MODULE.is_flat_card(frame))
+        self.assertIn("纯色/近白画面", note)
+        self.assertIn("向前找了 0.75s", note)
+
+    def test_hero_falls_back_to_first_frame_when_nothing_qualifies(self):
+        first = varied_frame()
+        with mock.patch.object(MODULE, "grab_frame", return_value=varied_frame()):
+            frame, note = MODULE.pick_hero_frame(
+                "unused", 4.13, 1.5, 0.0, 1.0, first
+            )
+        self.assertIs(frame, first)
+        self.assertEqual(note, "沿用首句 4.13s 的那一帧")
+
+    def test_zero_window_keeps_first_frame_without_extra_decoding(self):
+        first = slide_frame()
+        with mock.patch.object(MODULE, "grab_frame") as grabby:
+            frame, note = MODULE.pick_hero_frame("unused", 4.13, 0, 0.0, 1.0, first)
+        self.assertIs(frame, first)
+        self.assertEqual(note, "沿用首句 4.13s 的那一帧")
+        grabby.assert_not_called()
+
+    def test_a_candidate_that_fails_to_decode_is_dropped(self):
+        first = slide_frame()
+
+        def fake(video, when):
+            if round(when, 2) == 3.38:
+                raise SystemExit("取帧失败 @ 3.38s")
+            return person_frame() if round(when, 2) == 5.63 else slide_frame()
+
+        with mock.patch.object(MODULE, "grab_frame", side_effect=fake):
+            frame, note = MODULE.pick_hero_frame(
+                "unused", 4.13, 1.5, 0.0, 1.0, first
+            )
+        self.assertGreater(MODULE.skin_ratio(frame), MODULE.HERO_SKIN_MIN)
+        self.assertIn("5.63s", note)
+
+    def render(self, hero_search, tmp, lines=None):
+        lines = lines or [{"t": 4.13, "text": "First"}, {"t": 8.0, "text": "Second"}]
+
+        def fake(video, when):
+            return person_frame((1280, 720)) if when >= 5.0 else slide_frame((1280, 720))
+
+        with mock.patch.object(MODULE, "grab_frame", side_effect=fake), mock.patch.object(
+            MODULE, "draw_scripted_subtitle"
+        ):
+            out = Path(tmp) / f"hero-{hero_search}.jpg"
+            MODULE.scripted_render_one(
+                "unused", lines, out, (3, 4), None, 0.88, None, None, None,
+                hero_search=hero_search,
+            )
+        with Image.open(out) as rendered:
+            top = round(rendered.height * 0.8)
+            return rendered.crop((0, 0, rendered.width, top))
+
+    def test_scripted_render_swaps_a_slide_hero_for_a_person_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hero = self.render(None, tmp)
+        # 固定画布下默认就会选帧：首句是幻灯片，+1.5s 有人，主画面应当是那个人的画面。
+        self.assertGreater(MODULE.skin_ratio(hero), MODULE.HERO_SKIN_MIN)
+
+    def test_scripted_render_keeps_the_slide_hero_when_search_is_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hero = self.render(0, tmp)
+        # 反向验证：关掉选帧后主画面必须还是那张白底幻灯片。
+        ratio, _ = MODULE.frame_stats(hero)
+        self.assertGreaterEqual(ratio, MODULE.HERO_WHITE_MAX)
+        self.assertLess(MODULE.skin_ratio(hero), MODULE.HERO_SKIN_MIN)
 
 
 class CliIntegrationTests(unittest.TestCase):

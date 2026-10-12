@@ -159,6 +159,131 @@ def ensure_distinct_frames(frames, times, bands=None):
                 )
 
 
+# 主画面选帧只在首句时间点前后这个半径内找替代帧，保证画面仍然贴着第一句台词。
+HERO_SEARCH_SECONDS = 1.5
+# 肤色像素占比达到此值就认为画面里有人。
+# 实测（TED 类访谈，40 秒片段）：人像镜头 3.6%–5.3%，白底幻灯片 0.000%。
+HERO_SKIN_MIN = 0.02
+# 近白像素占比达到此值、或量化颜色数不超过 HERO_MIN_COLORS，判为纯色/近白卡片。
+# 实测：白底幻灯片近白占比 44%–58%、颜色数 11；人像镜头近白占比 0.000%、颜色数 35–41。
+HERO_WHITE_MAX = 0.40
+HERO_MIN_COLORS = 12
+
+
+def thumbnail_bytes(image, width):
+    """把画面缩成 width 宽的缩略图并返回 (RGB 字节, 像素数)。"""
+    height = max(1, round(image.height * width / image.width))
+    thumb = image.convert("RGB").resize((width, height), Image.Resampling.BILINEAR)
+    return thumb.tobytes(), width * height
+
+
+def skin_ratio(image, width=160):
+    """画面里肤色像素的占比，用来判断「这一帧有没有人」。
+
+    YCbCr 经验区间 Cb 77–127、Cr 133–173，再排除过暗像素。它能把
+    「白底幻灯片 0%」和「人像镜头 3%–5%」干净地分开，不需要任何模型或联网。
+    """
+    pixels, total = thumbnail_bytes(image, width)
+    hits = 0
+    for index in range(0, len(pixels), 3):
+        red, green, blue = pixels[index], pixels[index + 1], pixels[index + 2]
+        cb = 128 - 0.168736 * red - 0.331264 * green + 0.5 * blue
+        cr = 128 + 0.5 * red - 0.418688 * green - 0.081312 * blue
+        if 77 <= cb <= 127 and 133 <= cr <= 173 and red > 60:
+            hits += 1
+    return hits / total
+
+
+def frame_stats(image, width=96):
+    """缩略图的（近白像素占比, 量化颜色数）。
+
+    只做粗分类，不做内容识别：白底幻灯片近白占比 44%–58%、颜色数 11；
+    人像镜头近白占比 0.000%、颜色数 35–41。
+    """
+    pixels, total = thumbnail_bytes(image, width)
+    near_white = 0
+    seen = bytearray(4096)
+    colors = 0
+    for index in range(0, len(pixels), 3):
+        red, green, blue = pixels[index], pixels[index + 1], pixels[index + 2]
+        if red > 228 and green > 228 and blue > 228:
+            near_white += 1
+        slot = ((red >> 4) << 8) | ((green >> 4) << 4) | (blue >> 4)
+        if not seen[slot]:
+            seen[slot] = 1
+            colors += 1
+    return near_white / total, colors
+
+
+def is_flat_card(image):
+    """纯色/近白卡片：幻灯片、标题板、空白帧。"""
+    ratio, colors = frame_stats(image)
+    return ratio >= HERO_WHITE_MAX or colors <= HERO_MIN_COLORS
+
+
+def hero_candidate_offsets(window, steps=2):
+    """主画面搜索的偏移量：0 在最前，其余按与首句的距离由近到远。"""
+    offsets = {0.0}
+    for step in range(1, steps + 1):
+        delta = round(window * step / steps, 3)
+        offsets.add(-delta)
+        offsets.add(delta)
+    return sorted(offsets, key=lambda value: (abs(value), value))
+
+
+def hero_note(base_time, offset, reason):
+    direction = "后" if offset > 0 else "前"
+    return (
+        f"主画面改用 {base_time + offset:.2f}s 的那一帧"
+        f"（{reason}，向{direction}找了 {abs(offset):.2f}s）"
+    )
+
+
+def pick_hero_frame(video, base_time, window, frame_top, frame_bottom, first_frame):
+    """挑主画面：首句那一帧没人时，就近换成「画面里有人」的一帧。
+
+    只在 base_time ± window 内找，换来的帧仍然贴着第一句台词。判定顺序：
+    ① 首句那一帧本来就有人 → 原样保留；② 窗口内有人 → 取离首句最近的那一帧；
+    ③ 窗口内都没人、首句是纯色/近白卡片 → 取最近的「不是卡片」的一帧；④ 否则原样保留。
+    first_frame 是首句时间点已经取好的画面，直接复用，不重复解码；
+    额外候选帧取失败时只丢弃该候选，不影响出图。
+    """
+    keep = (first_frame, f"沿用首句 {base_time:.2f}s 的那一帧")
+    if window <= 0:
+        return keep
+    candidates = [(0.0, first_frame)]
+    seen = {round(base_time, 3)}
+    for offset in hero_candidate_offsets(window):
+        when = round(max(0.0, base_time + offset), 3)
+        if when in seen:
+            continue
+        seen.add(when)
+        try:
+            frame = crop_band(grab_frame(video, when), frame_top, frame_bottom)[0]
+        except SystemExit:
+            continue
+        candidates.append((round(when - base_time, 3), frame))
+    scored = [
+        (abs(offset), offset, frame, skin_ratio(frame))
+        for offset, frame in candidates
+    ]
+    # 首句那一帧的偏移量是 0，排序后必定排在最前。
+    scored.sort(key=lambda item: (item[0], item[1]))
+    if scored[0][3] >= HERO_SKIN_MIN:
+        return first_frame, f"沿用首句 {base_time:.2f}s 的那一帧（画面里有人）"
+    people = [item for item in scored if item[3] >= HERO_SKIN_MIN]
+    if people:
+        return people[0][2], hero_note(base_time, people[0][1], "首句那一帧里没有人")
+    if is_flat_card(first_frame):
+        plain = [item for item in scored if not is_flat_card(item[2])]
+        if plain:
+            return plain[0][2], hero_note(
+                base_time, plain[0][1], "首句那一帧是纯色/近白画面"
+            )
+        return first_frame, f"沿用首句 {base_time:.2f}s 的那一帧（候选都是纯色/近白画面）"
+    return keep
+
+
 def parse_aspect(value):
     try:
         parts = value.split(":")
@@ -485,6 +610,7 @@ def scripted_render_one(
     layout="fixed",
     frame_top=0.0,
     frame_bottom=1.0,
+    hero_search=None,
     check_duplicates=False,
 ):
     frames = [
@@ -494,6 +620,14 @@ def scripted_render_one(
     if check_duplicates:
         ensure_distinct_frames(frames, [line["t"] for line in lines])
     first_frame = frames[0]
+    # 固定画布下主画面只是引子，允许就近换成有人的一帧；
+    # 原比例布局的帧自带烧录字幕，必须与时间点对齐，不做选帧。
+    hero_search = HERO_SEARCH_SECONDS if hero_search is None else hero_search
+    if layout == "fixed" and hero_search > 0:
+        first_frame, note = pick_hero_frame(
+            video, lines[0]["t"], hero_search, frame_top, frame_bottom, frames[0]
+        )
+        print(f"主画面: {note}")
     out_width = out_width or (first_frame.width if layout == "natural" else 1440)
     if layout == "natural":
         hero = scale_to_width(first_frame, out_width)
@@ -840,6 +974,7 @@ def command_render_script(args):
         args.layout,
         args.frame_top,
         args.frame_bottom,
+        hero_search=args.hero_search,
         check_duplicates=not args.allow_duplicate_frames,
     )
 
@@ -943,6 +1078,14 @@ def main():
     scripted.add_argument("--font", help="中文字体文件；未指定时尝试系统字体")
     scripted.add_argument("--font-size", type=int, help="基础字号，过长台词仍会自动缩小")
     scripted.add_argument(
+        "--hero-search",
+        type=float,
+        help=(
+            "主画面选帧半径（秒，默认 1.5）：首句那一帧里没人时，"
+            "在这个范围内就近换成有人的一帧；0 表示固定用首句那一帧"
+        ),
+    )
+    scripted.add_argument(
         "--allow-duplicate-frames",
         action="store_true",
         help="跳过重复画面检查（默认遇到静态封面或重复字幕条会中止）",
@@ -969,6 +1112,11 @@ def main():
         getattr(args, "fit", None) is not None or getattr(args, "crop_center", None) is not None
     ):
         raise SystemExit("--layout natural 不接受 --fit 或 --crop-center；它们只用于固定画布")
+    if getattr(args, "layout", None) == "natural" and getattr(args, "hero_search", None) is not None:
+        raise SystemExit(
+            "--layout natural 不接受 --hero-search；"
+            "原比例布局的帧自带烧录字幕，必须与时间点对齐"
+        )
     if getattr(args, "crop_center", None) is not None:
         if not 0 <= args.crop_center <= 1:
             raise SystemExit("--crop-center 必须在 0–1 之间")
@@ -980,6 +1128,10 @@ def main():
         raise SystemExit("--band-center 必须在 0.10–0.98 之间")
     if getattr(args, "font_size", None) is not None and args.font_size < 12:
         raise SystemExit("--font-size 不能小于 12")
+    if getattr(args, "hero_search", None) is not None:
+        args.hero_search = validate_time(args.hero_search, "--hero-search")
+        if args.hero_search > 10:
+            raise SystemExit("--hero-search 不能大于 10 秒；主画面必须贴着第一句台词")
     if (
         hasattr(args, "hero_fraction")
         and args.hero_fraction is not None
