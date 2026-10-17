@@ -284,6 +284,78 @@ def pick_hero_frame(video, base_time, window, frame_top, frame_bottom, first_fra
     return keep
 
 
+# 字幕带自动避让：脚本模式自己画字幕，所以字幕带不该压在画面自带的文字/图形上。
+# 实测（TED 片段 854x480，带高占画面 21.6%）：
+#   带位压在幻灯片自带的 STEEL 大字上 → 逐行边缘强度 0.1031；
+#   落在干净区域（最优带位）→ 0.0152；人像镜头的腿（不压字）→ 0.0190。
+STRIP_BAND_TEXT_FLOOR = 0.04
+STRIP_BAND_GAIN = 0.6
+STRIP_BAND_MIN = 0.10
+STRIP_BAND_MAX = 0.90
+STRIP_BAND_STEP = 0.02
+STRIP_BAND_PROFILE_WIDTH = 160
+
+
+def row_edge_energy(frame, width=STRIP_BAND_PROFILE_WIDTH):
+    """逐行边缘强度（0–1），按行给出画面「自带文字/图形」的密度。
+
+    缩略图等比缩到 width 宽，行数与帧高不同，所以带窗口要走 band_window() 换算。
+    """
+    height = max(1, round(frame.height * width / frame.width))
+    gray = frame.convert("L").resize((width, height), Image.Resampling.BILINEAR)
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    return [
+        value / 255
+        for value in edges.resize((1, height), Image.Resampling.BOX).tobytes()
+    ]
+
+
+def band_window(center, frame_height, band_height, rows):
+    """把像素坐标的带窗口换算到逐行轮廓的行空间。"""
+    top = round(frame_height * center) - band_height // 2
+    top = max(0, min(frame_height - band_height, top))
+    span = max(1, round(band_height * rows / frame_height))
+    return max(0, min(rows - span, round(top * rows / frame_height))), span
+
+
+def band_energy(profiles, frame_height, band_height, center):
+    top, span = band_window(center, frame_height, band_height, len(profiles[0]))
+    return sum(sum(profile[top:top + span]) for profile in profiles) / (
+        span * len(profiles)
+    )
+
+
+def choose_strip_center(frames, band_height, requested):
+    """整张图统一选一条字幕带，避开画面自带的文字/图形。返回 (带位, 说明)。
+
+    请求位没压到东西就沿用它（不动本来正常的素材）；只有请求位明显压着画面自带的
+    文字/图形、且存在明显更干净的带位时才挪。整张图统一一条，避免各条高度跳来跳去。
+    """
+    if not frames:
+        return requested, None
+    frame_height = frames[0].height
+    profiles = [row_edge_energy(frame) for frame in frames]
+    current = band_energy(profiles, frame_height, band_height, requested)
+    if current < STRIP_BAND_TEXT_FLOOR:
+        return requested, None
+    steps = range(
+        round(STRIP_BAND_MIN * 100),
+        round(STRIP_BAND_MAX * 100) + 1,
+        round(STRIP_BAND_STEP * 100),
+    )
+    best = min(
+        ((step / 100, band_energy(profiles, frame_height, band_height, step / 100))
+         for step in steps),
+        key=lambda item: item[1],
+    )
+    if best[1] > current * STRIP_BAND_GAIN:
+        return requested, None
+    return best[0], (
+        f"带位从 {requested:.2f} 挪到 {best[0]:.2f}"
+        f"（原位置压在画面自带的文字/图形上，边缘强度 {current:.3f} → {best[1]:.3f}）"
+    )
+
+
 def parse_aspect(value):
     try:
         parts = value.split(":")
@@ -662,6 +734,13 @@ def scripted_render_one(
     strip_heights = [base_strip] * strip_count
     strip_heights[-1] += remaining - sum(strip_heights)
     base_font = font_size or max(24, round(out_width / 18))
+
+    # 字幕带避让画面自带的文字/图形；请求位本来就干净时原样沿用。
+    band_center, band_note = choose_strip_center(
+        frames[1:], round(frames[1].width * strip_heights[0] / out_width), band_center
+    )
+    if band_note:
+        print(f"字幕带: {band_note}")
 
     hero = ImageOps.fit(
         first_frame,

@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import re
 import subprocess
@@ -394,6 +396,35 @@ def varied_frame(size=(640, 360)):
     return frame
 
 
+def video_text_frame(size=(854, 480), center=0.5, thickness=0.14):
+    """深色底 + 一条像大字的竖笔画，模拟画面自带的标题/Logo。"""
+    frame = Image.new("RGB", size, (22, 26, 34))
+    draw = ImageDraw.Draw(frame)
+    band = thickness * size[1]
+    top = center * size[1] - band / 2
+    for x in range(int(size[0] * 0.06), int(size[0] * 0.94), 13):
+        draw.rectangle((x, top + band * 0.18, x + 6, top + band * 0.82), fill="white")
+    return frame
+
+
+def clean_video_frame(size=(854, 480)):
+    """同一底色、只有极低对比度的大色块：没有自带文字。"""
+    frame = Image.new("RGB", size, (22, 26, 34))
+    draw = ImageDraw.Draw(frame)
+    draw.rectangle((0, 0, size[0], int(size[1] * 0.10)), fill=(27, 31, 40))
+    draw.rectangle((0, int(size[1] * 0.72), size[0], size[1]), fill=(26, 30, 38))
+    return frame
+
+
+def striped_frame(size=(854, 480)):
+    """满屏等距横纹：任何带位都差不多脏，用来守「别为了几个百分点瞎挪」。"""
+    frame = Image.new("RGB", size, "white")
+    draw = ImageDraw.Draw(frame)
+    for y in range(0, size[1], 8):
+        draw.rectangle((0, y, size[0], y + 4), fill="black")
+    return frame
+
+
 class SideCropTests(unittest.TestCase):
     def assertSubtitlesInside(self, canvas):
         """白色笔画的左右边界都不能贴到画布边缘，否则说明字被裁了。"""
@@ -633,6 +664,130 @@ class HeroFrameTests(unittest.TestCase):
         ratio, _ = MODULE.frame_stats(hero)
         self.assertGreaterEqual(ratio, MODULE.HERO_WHITE_MAX)
         self.assertLess(MODULE.skin_ratio(hero), MODULE.HERO_SKIN_MIN)
+
+
+class StripBandTests(unittest.TestCase):
+    # 1440x1920 画布、7 行字幕时，每条字幕带在 854x480 源画面上的高度是 144 像素。
+    BAND = 144
+
+    def test_row_profile_is_far_shorter_than_the_frame(self):
+        frame = video_text_frame()
+        profile = MODULE.row_edge_energy(frame)
+        # 160 宽缩略图 → 90 行，和 480 像素行不是一回事：带窗口必须换算。
+        self.assertEqual(len(profile), 90)
+        self.assertNotEqual(len(profile), frame.height)
+        self.assertGreater(max(profile), 0.4)
+        # 第 0 行会被 FIND_EDGES 当成画面边界，取画面内部的干净行做对照。
+        self.assertLess(profile[10], 0.05)
+
+    def test_band_window_maps_pixel_rows_into_profile_rows(self):
+        self.assertEqual(MODULE.band_window(0.96, 480, 144, 90), (63, 27))
+        self.assertEqual(MODULE.band_window(0.50, 480, 144, 90), (32, 27))
+        # 轮廓行数少于带的行数时，至少保留一行，不能切片成空。
+        self.assertEqual(MODULE.band_window(0.96, 480, 144, 6), (4, 2))
+        self.assertEqual(MODULE.band_window(0.50, 480, 144, 480), (168, 144))
+
+    def test_band_window_never_leaves_the_profile(self):
+        for rows in (6, 45, 90, 481):
+            for center in (0.0, 0.1, 0.37, 0.5, 0.9, 1.0):
+                top, span = MODULE.band_window(center, 480, 144, rows)
+                with self.subTest(rows=rows, center=center):
+                    self.assertGreaterEqual(span, 1)
+                    self.assertGreaterEqual(top, 0)
+                    self.assertLessEqual(top + span, rows)
+
+    def test_energy_tracks_the_painted_text_band(self):
+        middle = video_text_frame(center=0.5)
+        profile = MODULE.row_edge_energy(middle)
+        on_text = MODULE.band_energy([profile], middle.height, self.BAND, 0.50)
+        off_text = MODULE.band_energy([profile], middle.height, self.BAND, 0.20)
+        self.assertGreater(on_text, MODULE.STRIP_BAND_TEXT_FLOOR)
+        self.assertLess(off_text, MODULE.STRIP_BAND_TEXT_FLOOR / 4)
+        # 同一套代码在「字在底部」的画面上必须把底部判得更脏，不能只会认中间。
+        bottom = video_text_frame(center=0.96)
+        bottom_profile = MODULE.row_edge_energy(bottom)
+        self.assertGreater(
+            MODULE.band_energy([bottom_profile], bottom.height, self.BAND, 0.96),
+            MODULE.band_energy([bottom_profile], bottom.height, self.BAND, 0.30),
+        )
+
+    def test_clean_requested_position_is_kept(self):
+        center, note = MODULE.choose_strip_center([clean_video_frame()], self.BAND, 0.96)
+        self.assertEqual(center, 0.96)
+        self.assertIsNone(note)
+
+    def test_no_frames_keeps_the_requested_position(self):
+        self.assertEqual(MODULE.choose_strip_center([], self.BAND, 0.96), (0.96, None))
+
+    def test_band_moves_off_the_painted_text(self):
+        frame = video_text_frame(center=0.96)
+        center, note = MODULE.choose_strip_center([frame], self.BAND, 0.96)
+        profile = MODULE.row_edge_energy(frame)
+        before = MODULE.band_energy([profile], frame.height, self.BAND, 0.96)
+        after = MODULE.band_energy([profile], frame.height, self.BAND, center)
+        self.assertNotEqual(center, 0.96)
+        self.assertIn("挪到", note)
+        self.assertIn(f"{before:.3f}", note)
+        self.assertLess(after, before * MODULE.STRIP_BAND_GAIN)
+        self.assertLess(after, MODULE.STRIP_BAND_TEXT_FLOOR)
+        self.assertGreaterEqual(center, MODULE.STRIP_BAND_MIN)
+        self.assertLessEqual(center, MODULE.STRIP_BAND_MAX)
+
+    def test_uniform_texture_is_not_worth_moving(self):
+        frame = striped_frame()
+        profile = MODULE.row_edge_energy(frame)
+        # 前提：这个画面确实脏过地板，否则这里测到的只是「本来就干净」。
+        self.assertGreater(
+            MODULE.band_energy([profile], frame.height, self.BAND, 0.50),
+            MODULE.STRIP_BAND_TEXT_FLOOR,
+        )
+        center, note = MODULE.choose_strip_center([frame], self.BAND, 0.50)
+        self.assertEqual(center, 0.50)
+        self.assertIsNone(note)
+
+    def render(self, tmp, name, floor=None):
+        """渲染一张图，只留下字幕条区域；返回 (逐行边缘强度均值, 打印内容)。"""
+        lines = [
+            {"t": 1.0, "text": "First"},
+            {"t": 2.0, "text": "Second"},
+            {"t": 3.0, "text": "Third"},
+        ]
+        frame = video_text_frame((1280, 720), center=0.90, thickness=0.20)
+        out = Path(tmp) / f"{name}.jpg"
+        log = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(MODULE, "grab_frame", return_value=frame))
+            stack.enter_context(mock.patch.object(MODULE, "draw_scripted_subtitle"))
+            if floor is not None:
+                stack.enter_context(
+                    mock.patch.object(MODULE, "STRIP_BAND_TEXT_FLOOR", floor)
+                )
+            with contextlib.redirect_stdout(log):
+                MODULE.scripted_render_one(
+                    "unused", lines, out, (3, 4), 1440, 0.90, None, None, None,
+                    hero_search=0,
+                )
+        with Image.open(out) as rendered:
+            # 3 句 → 主画面 82%，下面两条就是纯源画面像素（字幕由 mock 关掉了）。
+            area = rendered.crop(
+                (0, round(rendered.height * 0.82), rendered.width, rendered.height)
+            )
+        profile = MODULE.row_edge_energy(area)
+        return sum(profile) / len(profile), log.getvalue()
+
+    def test_scripted_render_moves_the_strips_off_the_video_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            energy, log = self.render(tmp, "avoid")
+        self.assertLess(energy, MODULE.STRIP_BAND_TEXT_FLOOR)
+        self.assertIn("字幕带: 带位从 0.90 挪到", log)
+
+    def test_scripted_render_keeps_the_text_when_avoidance_is_off(self):
+        # 反向验证：把地板抬到永远不满足＝退回改之前的行为，
+        # 字幕条必须重新压在画面自带的文字上，且不再打印带位说明。
+        with tempfile.TemporaryDirectory() as tmp:
+            energy, log = self.render(tmp, "keep", floor=99)
+        self.assertGreater(energy, MODULE.STRIP_BAND_TEXT_FLOOR)
+        self.assertNotIn("字幕带:", log)
 
 
 class CliIntegrationTests(unittest.TestCase):
