@@ -60,8 +60,22 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(MODULE.choose_hero_fraction(4), 0.7)
         self.assertEqual(MODULE.choose_hero_fraction(3), 0.775)
         self.assertEqual(MODULE.choose_hero_fraction(2), 0.82)
-        self.assertEqual(MODULE.choose_hero_fraction(7), 0.48)
+        self.assertEqual(MODULE.choose_hero_fraction(7), 0.475)
+        self.assertEqual(MODULE.choose_hero_fraction(10), 0.25)
+        # 14 条时公式算到 0.02，被下限兜住：主画面至少留 20% 高度
+        self.assertEqual(MODULE.choose_hero_fraction(14), 0.2)
         self.assertEqual(MODULE.choose_hero_fraction(4, 0.6), 0.6)
+
+    def test_dense_rows_stay_readable_at_full_height(self):
+        """行数拉满时，条高与字号仍要落在可读区间（1440 宽的 3:4 画布）。"""
+        out_height, out_width = 1920, 1440
+        for strip_count in (2, 6, 10, 14):
+            fraction = MODULE.choose_hero_fraction(strip_count)
+            hero = round(out_height * fraction)
+            strip = (out_height - hero) // strip_count
+            font = min(max(24, round(out_width / 18)), max(16, round(strip * 0.62)))
+            self.assertGreaterEqual(strip, 100, f"{strip_count} 条时条高 {strip}px 太薄")
+            self.assertGreaterEqual(font, 60, f"{strip_count} 条时字号 {font}px 太小")
 
     def test_script_lines_require_increasing_timestamps_and_text(self):
         lines = MODULE.normalize_script_lines(
@@ -84,22 +98,22 @@ class HelperTests(unittest.TestCase):
                 },
                 3,
             )
-        with self.assertRaisesRegex(SystemExit, "最多支持 7"):
+        with self.assertRaisesRegex(SystemExit, "最多支持 15"):
             MODULE.normalize_script_lines(
                 {
                     "lines": [
                         {"t": index / 10, "text": f"Line {index}"}
-                        for index in range(8)
+                        for index in range(16)
                     ]
                 },
                 3,
             )
 
     def test_native_times_share_script_mode_cap(self):
-        times = MODULE.normalize_times([index / 10 for index in range(7)])
-        self.assertEqual(len(times), 7)
-        with self.assertRaisesRegex(SystemExit, "最多支持 7"):
-            MODULE.normalize_times([index / 10 for index in range(8)])
+        times = MODULE.normalize_times([index / 10 for index in range(15)])
+        self.assertEqual(len(times), 15)
+        with self.assertRaisesRegex(SystemExit, "最多支持 15"):
+            MODULE.normalize_times([index / 10 for index in range(16)])
 
     def test_cjk_detection_covers_chinese_japanese_and_korean(self):
         self.assertTrue(MODULE.contains_cjk("中文"))
@@ -745,7 +759,7 @@ class StripBandTests(unittest.TestCase):
         self.assertEqual(center, 0.50)
         self.assertIsNone(note)
 
-    def render(self, tmp, name, floor=None):
+    def render(self, tmp, name, floor=None, band_auto=True):
         """渲染一张图，只留下字幕条区域；返回 (逐行边缘强度均值, 打印内容)。"""
         lines = [
             {"t": 1.0, "text": "First"},
@@ -765,7 +779,7 @@ class StripBandTests(unittest.TestCase):
             with contextlib.redirect_stdout(log):
                 MODULE.scripted_render_one(
                     "unused", lines, out, (3, 4), 1440, 0.90, None, None, None,
-                    hero_search=0,
+                    hero_search=0, band_auto=band_auto,
                 )
         with Image.open(out) as rendered:
             # 3 句 → 主画面 82%，下面两条就是纯源画面像素（字幕由 mock 关掉了）。
@@ -786,6 +800,15 @@ class StripBandTests(unittest.TestCase):
         # 字幕条必须重新压在画面自带的文字上，且不再打印带位说明。
         with tempfile.TemporaryDirectory() as tmp:
             energy, log = self.render(tmp, "keep", floor=99)
+        self.assertGreater(energy, MODULE.STRIP_BAND_TEXT_FLOOR)
+        self.assertNotIn("字幕带:", log)
+
+
+    def test_no_band_auto_pins_the_requested_position(self):
+        # 墙纸、格栅这类高频图案会被当成画面自带文字，把带位甩到画面边缘。
+        # --no-band-auto 是这种场景的逃生口：请求位必须原样用，也不打印说明。
+        with tempfile.TemporaryDirectory() as tmp:
+            energy, log = self.render(tmp, "pinned", band_auto=False)
         self.assertGreater(energy, MODULE.STRIP_BAND_TEXT_FLOOR)
         self.assertNotIn("字幕带:", log)
 

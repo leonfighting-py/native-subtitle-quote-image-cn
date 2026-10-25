@@ -23,8 +23,14 @@ except ImportError:
     if not FFMPEG:
         sys.exit("找不到 ffmpeg；请安装 ffmpeg 或 imageio-ffmpeg")
 
-# 每张图最多 1 个主画面 + 6 个字幕条；再多字幕条会被压到不可读。
-MAX_TIMES_PER_IMAGE = 7
+# 每张图最多 1 个主画面 + 14 个字幕条。
+# 条数多时主画面自动让位（见 choose_hero_fraction），条高被压到 110px 左右仍可读；
+# 再把行数往上加，条就会薄到字压字。
+MAX_TIMES_PER_IMAGE = 15
+# 纯文字字幕行的底色与行间分隔线。黑得纯粹会和描边糊在一起，用一点冷灰；
+# 分隔线压在行顶，不额外占高度。
+STRIP_TEXT_COLOR = "#0c0c0e"
+STRIP_TEXT_RULE = "#2a2a30"
 # 缩略图上亮度变化超过 DIFF_LEVEL 的像素占比低于此值，视为同一画面。
 # 真实访谈相邻句子的整帧差异通常在 5% 以上；静态封面重编码后接近 0。
 DUPLICATE_PIXEL_RATIO = 0.005
@@ -454,6 +460,14 @@ def draw_scripted_subtitle(image, text, y_center, font_path, font_size, max_widt
     )
 
 
+def draw_text_rule(strip):
+    """纯文字行的行间分隔线；压在行顶，不为它额外留高度。"""
+    draw = ImageDraw.Draw(strip)
+    draw.rectangle(
+        [0, 0, strip.width, max(1, strip.height // 60)], fill=STRIP_TEXT_RULE
+    )
+
+
 def normalize_script_lines(data, duration):
     lines = data.get("lines") if isinstance(data, dict) else None
     if not isinstance(lines, list) or len(lines) < 2:
@@ -522,12 +536,17 @@ def fit_lower(image, size, vertical=0.72):
 
 
 def choose_hero_fraction(strip_count, requested=None):
-    """保持字幕条紧凑；台词较少时把多余高度留给主画面。"""
+    """保持字幕条紧凑；台词较少时把多余高度留给主画面。
+
+    条数越多，主画面让出越多高度，条高稳定落在 110–180px（1440 宽画布）。
+    实测 4 条 → 180px、8 条 → 162px、14 条 → 110px，都在可读区间；
+    下限 0.20 是主画面还能辨认出人脸的临界，再低就只剩一条横带。
+    """
     if strip_count <= 0:
         raise SystemExit("至少需要 1 个字幕条")
     if requested is not None:
         return requested
-    return min(0.82, max(0.48, 1.0 - strip_count * 0.075))
+    return min(0.82, max(0.20, 1.0 - strip_count * 0.075))
 
 
 def scale_to_width(image, width):
@@ -684,6 +703,8 @@ def scripted_render_one(
     frame_bottom=1.0,
     hero_search=None,
     check_duplicates=False,
+    strip_style="frame",
+    band_auto=True,
 ):
     frames = [
         crop_band(grab_frame(video, line["t"]), frame_top, frame_bottom)[0]
@@ -736,11 +757,15 @@ def scripted_render_one(
     base_font = font_size or max(24, round(out_width / 18))
 
     # 字幕带避让画面自带的文字/图形；请求位本来就干净时原样沿用。
-    band_center, band_note = choose_strip_center(
-        frames[1:], round(frames[1].width * strip_heights[0] / out_width), band_center
-    )
-    if band_note:
-        print(f"字幕带: {band_note}")
+    # 纯文字行没有画面切片，不需要避让。
+    # 墙纸、格栅这类高频图案会被当成「文字」，误把带位甩到画面边缘，
+    # 这种场景用 --no-band-auto 锁定人工量过的带位。
+    if strip_style == "frame" and band_auto:
+        band_center, band_note = choose_strip_center(
+            frames[1:], round(frames[1].width * strip_heights[0] / out_width), band_center
+        )
+        if band_note:
+            print(f"字幕带: {band_note}")
 
     hero = ImageOps.fit(
         first_frame,
@@ -759,20 +784,29 @@ def scripted_render_one(
     )
 
     strips = []
-    for line, frame, strip_height in zip(lines[1:], frames[1:], strip_heights):
-        source_height = max(
-            1, round(frame.width * strip_height / out_width)
-        )
-        source_height = min(source_height, frame.height)
-        center_y = round(frame.height * band_center)
-        y0 = max(0, min(frame.height - source_height, center_y - source_height // 2))
-        band = frame.crop((0, y0, frame.width, y0 + source_height))
-        strip = ImageOps.fit(
-            band,
-            (out_width, strip_height),
-            method=Image.Resampling.LANCZOS,
-            centering=(0.5, 0.5),
-        )
+    for index, (line, frame, strip_height) in enumerate(
+        zip(lines[1:], frames[1:], strip_heights)
+    ):
+        if strip_style == "text":
+            # 纯文字行：不再横切画面。行数多时画面切片会互相打架
+            # （每句一个机位、一条带），只剩噪点，不如让文字自己排。
+            strip = Image.new("RGB", (out_width, strip_height), STRIP_TEXT_COLOR)
+            if index:
+                draw_text_rule(strip)
+        else:
+            source_height = max(
+                1, round(frame.width * strip_height / out_width)
+            )
+            source_height = min(source_height, frame.height)
+            center_y = round(frame.height * band_center)
+            y0 = max(0, min(frame.height - source_height, center_y - source_height // 2))
+            band = frame.crop((0, y0, frame.width, y0 + source_height))
+            strip = ImageOps.fit(
+                band,
+                (out_width, strip_height),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
         draw_scripted_subtitle(
             strip,
             line["text"],
@@ -1055,6 +1089,8 @@ def command_render_script(args):
         args.frame_bottom,
         hero_search=args.hero_search,
         check_duplicates=not args.allow_duplicate_frames,
+        strip_style=args.strip_style,
+        band_auto=args.band_auto,
     )
 
 
@@ -1168,6 +1204,25 @@ def main():
         "--allow-duplicate-frames",
         action="store_true",
         help="跳过重复画面检查（默认遇到静态封面或重复字幕条会中止）",
+    )
+    scripted.add_argument(
+        "--strip-style",
+        choices=("frame", "text"),
+        default="frame",
+        help=(
+            "字幕行的样子：frame 从对应帧横切一条画面当底（默认）；"
+            "text 只用纯色底排文字，行数多时画面切片会互相打架，适合一图十几句"
+        ),
+    )
+    scripted.add_argument(
+        "--no-band-auto",
+        dest="band_auto",
+        action="store_false",
+        help=(
+            "锁死 --band-center 指定的带位，不做自动避让。"
+            "墙纸、格栅这类高频图案会被误判成画面自带文字，"
+            "导致带位被甩到画面边缘时用这个"
+        ),
     )
     scripted.add_argument("--overwrite", action="store_true")
     scripted.set_defaults(func=command_render_script)
